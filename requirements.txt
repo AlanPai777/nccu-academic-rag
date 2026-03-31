@@ -1,0 +1,35 @@
+# Web crawling & HTML parsing
+httpx
+beautifulsoup4
+lxml
+
+# Document parsing
+pdfplumber
+python-docx
+openpyxl
+
+# RAG: Embedding & Reranking
+FlagEmbedding
+
+# RAG: Vector database
+qdrant-client
+
+# RAG: Utilities
+langdetect
+tiktoken
+
+# Web UI
+gradio
+
+# Note: PyTorch (required by FlagEmbedding) is NOT listed here.
+# Install it separately based on your hardware:
+#
+# CPU only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# NVIDIA GPU (CUDA):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# Intel GPU (Arc / Core Ultra iGPU):
+#   Use ipex-llm Ollama for embedding and LLM inference.
+#   See: https://github.com/intel/ipex-llm
