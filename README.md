@@ -91,6 +91,15 @@ The crawled HTML/PDF files and `rag/chunks.jsonl` are **not included** in this r
 3. Run `python rag/build_chunks.py` to generate `rag/chunks.jsonl`
 4. Run `python rag/main.py --build-index` to index into Qdrant
 
+If you want to test the extracted text with an external (closed-source) LLM outside of this pipeline, run `python rag/preprocess_all.py` instead. This produces `output/extracted_texts.jsonl` — one JSON record per page — and is independent of the chunking, indexing, and retrieval steps.
+
+Each record contains:
+- `url` — source URL of the page or document
+- `title` — last path segment of the URL
+- `source_type` — `html` or `pdf`
+- `category` — site category from the crawler metadata
+- `text` — clean extracted text, ready to pass to an LLM
+
 ---
 
 ## Setup
@@ -159,16 +168,17 @@ python rag/main.py --query "What are the graduation requirements?"
 
 ```
 rag/
-├── preprocess.py     # HTML/PDF content extraction, noise removal
-├── chunker.py        # HTML chunking (800 chars, 100-char overlap); PDF chunking (512 tokens, 128-token overlap)
-├── build_chunks.py   # Batch preprocessing pipeline → chunks.jsonl
-├── embedder.py       # bge-m3 embedding via Ollama API
-├── indexer.py        # Qdrant collection creation and bulk upsert
-├── retriever.py      # Dense retrieval + cross-encoder reranking
-├── generator.py      # LLM answer generation with source citation
-├── pipeline.py       # End-to-end RAG pipeline (query → answer)
-├── main.py           # CLI entry point (--query, --build-index)
-└── app.py            # Gradio web UI
+├── preprocess.py       # HTML/PDF content extraction, noise removal
+├── preprocess_all.py   # Batch extraction → output/extracted_texts.jsonl
+├── chunker.py          # HTML chunking (800 chars, 100-char overlap); PDF chunking (512 tokens, 128-token overlap)
+├── build_chunks.py     # Batch preprocessing pipeline → chunks.jsonl
+├── embedder.py         # bge-m3 embedding via Ollama API
+├── indexer.py          # Qdrant collection creation and bulk upsert
+├── retriever.py        # Dense retrieval + cross-encoder reranking
+├── generator.py        # LLM answer generation with source citation
+├── pipeline.py         # End-to-end RAG pipeline (query → answer)
+├── main.py             # CLI entry point (--query, --build-index)
+└── app.py              # Gradio web UI
 ```
 
 ---
