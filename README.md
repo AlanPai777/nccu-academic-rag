@@ -160,7 +160,7 @@ python rag/main.py --query "What are the graduation requirements?"
 ```
 rag/
 ├── preprocess.py     # HTML/PDF content extraction, noise removal
-├── chunker.py        # Fixed-size chunking (512 chars, 128 overlap)
+├── chunker.py        # HTML chunking (800 chars, 100-char overlap); PDF chunking (512 tokens, 128-token overlap)
 ├── build_chunks.py   # Batch preprocessing pipeline → chunks.jsonl
 ├── embedder.py       # bge-m3 embedding via Ollama API
 ├── indexer.py        # Qdrant collection creation and bulk upsert
