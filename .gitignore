@@ -20,6 +20,7 @@ build/
 # Dev tools
 .playwright-mcp/
 .claude/
+CLAUDE.md
 
 # Environment
 .env
