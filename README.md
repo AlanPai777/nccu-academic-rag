@@ -114,7 +114,7 @@ Pull the required models:
 ```bash
 # Clone the repo
 git clone <repo-url>
-cd nccu-rag
+cd nccu-academic-rag
 
 # Create virtual environment
 python3 -m venv venv
