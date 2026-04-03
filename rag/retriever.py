@@ -1,23 +1,22 @@
 """
-retriever.py — Dense search + bge-reranker-v2-m3 reranking.
+retriever.py — Dense search + Jina Reranker v2 reranking.
 
 Pipeline:
-    query → Ollama bge-m3 embed → Qdrant dense search top-50
-          → bge-reranker-v2-m3 rerank → top-5 chunks
+    query → Ollama qwen3-embedding → Qdrant dense search top-30
+          → Jina Reranker v2 cross-encoder rerank → top-5 chunks
 
 Usage:
     from rag.retriever import Retriever
     ret = Retriever()                          # auto-detect device
     ret = Retriever(reranker_device="cpu")     # force CPU
-    ret = Retriever(reranker_device="xpu")     # Intel GPU (需安裝驅動)
+    ret = Retriever(reranker_device="xpu")     # Intel GPU via ipex-llm
     ret = Retriever(reranker_device="cuda")    # NVIDIA GPU
     results = ret.retrieve("選課辦法是什麼？")
-    # results → list of {text, url, title, score, category, source_type}
+    # results → list of {text, text_clean, url, title, score, category, source_type}
 
 CLI:
     python rag/retriever.py --query "選課辦法"
     python rag/retriever.py --query "選課辦法" --reranker-device cpu
-    python rag/retriever.py --query "選課辦法" --reranker-device xpu
 """
 
 from __future__ import annotations
@@ -34,65 +33,63 @@ from qdrant_client import QdrantClient
 from rag.embedder import Embedder
 
 # ── Constants ──────────────────────────────────────────────────────────────── #
-COLLECTION   = "nccu_aca"
+COLLECTION   = "nccu_aca_v2_qwen3embedding"
 QDRANT_URL   = "http://localhost:6333"
-DENSE_TOP_K  = 50    # candidates from Qdrant
+DENSE_TOP_K  = 30    # candidates from Qdrant (reduced from 50 for speed)
 RERANK_TOP_N = 5     # final results after reranking
-RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+RERANKER_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
 
 # device 選項說明：
-#   "auto" → FlagEmbedding 自動偵測（有 CUDA 用 CUDA，否則 CPU）
-#   "cpu"  → 強制 CPU（最穩定，但最慢）
-#   "xpu"  → Intel GPU（需安裝 /dev/dri/ 驅動，WSL2 預設不可用）
+#   "auto" → 自動偵測（有 CUDA 用 CUDA，否則 CPU）
+#   "cpu"  → 強制 CPU（最穩定）
+#   "xpu"  → Intel GPU via ipex-llm
 #   "cuda" → NVIDIA GPU
 RERANKER_DEVICE = "auto"
 
 
 # ── Reranker ───────────────────────────────────────────────────────────────── #
 class Reranker:
-    """Lazy-load bge-reranker-v2-m3 cross-encoder.
+    """Lazy-load Jina Reranker v2 cross-encoder via sentence-transformers.
 
     Args:
-        use_fp16: 使用 FP16 半精度加速（GPU 時效果顯著，CPU 略有加速）
-        device:   運算裝置，"auto" / "cpu" / "xpu" / "cuda"
+        device: 運算裝置，"auto" / "cpu" / "xpu" / "cuda"
     """
 
-    def __init__(self, use_fp16: bool = True, device: str = RERANKER_DEVICE):
-        self.use_fp16 = use_fp16
-        self.device   = device
-        self._model   = None
+    def __init__(self, device: str = RERANKER_DEVICE):
+        self.device = device
+        self._model = None
 
     def _load(self) -> None:
         if self._model is not None:
             return
         try:
-            from FlagEmbedding import FlagReranker
+            from sentence_transformers import CrossEncoder
         except ImportError as e:
             raise ImportError(
-                "FlagEmbedding is required. Install with:\n"
-                "  pip install FlagEmbedding"
+                "sentence-transformers is required. Install with:\n"
+                "  pip install sentence-transformers"
             ) from e
 
         device_str = f" (device={self.device})" if self.device != "auto" else ""
         print(f"Loading {RERANKER_MODEL}{device_str}…")
 
-        kwargs: dict = {"use_fp16": self.use_fp16}
+        kwargs: dict = {}
         if self.device != "auto":
             kwargs["device"] = self.device
 
-        self._model = FlagReranker(RERANKER_MODEL, **kwargs)
+        self._model = CrossEncoder(RERANKER_MODEL, trust_remote_code=True, **kwargs)
         print(f"Reranker loaded on {self.device}.")
 
     def rerank(self, query: str, passages: list[str],
                top_n: int = RERANK_TOP_N) -> list[tuple[int, float]]:
         """
-        Score [query, passage] pairs.
+        Batch-score [query, passage] pairs using cross-encoder.
         Returns list of (original_index, score) sorted by score desc, top_n.
         """
         self._load()
-        pairs = [[query, p] for p in passages]
-        scores = self._model.compute_score(pairs, normalize=True)
-        if isinstance(scores, float):
+        pairs = [(query, p) for p in passages]
+        scores = self._model.predict(pairs, show_progress_bar=False)
+        if not hasattr(scores, '__len__'):
             scores = [scores]
         indexed = sorted(enumerate(scores), key=lambda x: -x[1])
         return indexed[:top_n]
@@ -113,7 +110,7 @@ class Retriever:
         self.dense_top_k  = dense_top_k
         self.rerank_top_n = rerank_top_n
         self.embedder  = Embedder()
-        self.reranker  = Reranker(use_fp16=True, device=reranker_device)
+        self.reranker  = Reranker(device=reranker_device)
         self.client    = QdrantClient(url=qdrant_url)
 
     # ---------------------------------------------------------------------- #
@@ -130,11 +127,13 @@ class Retriever:
         return [
             {
                 "text":        h.payload.get("text", ""),
+                "text_clean":  h.payload.get("text_clean", h.payload.get("text", "")),
                 "url":         h.payload.get("url", ""),
                 "title":       h.payload.get("title", ""),
                 "category":    h.payload.get("category", ""),
                 "source_type": h.payload.get("source_type", ""),
                 "chunk_index": h.payload.get("chunk_index", 0),
+                "chunk_type":  h.payload.get("chunk_type", "content"),
                 "qdrant_score": h.score,
             }
             for h in results.points
@@ -162,8 +161,8 @@ class Retriever:
         if not candidates:
             return []
 
-        # 3. Rerank candidates
-        passages = [c["text"] for c in candidates]
+        # 3. Rerank candidates (use text_clean to avoid URL noise)
+        passages = [c.get("text_clean", c["text"]) for c in candidates]
         ranked   = self.reranker.rerank(query, passages, top_n=top_n)
 
         # 4. Build final results

@@ -27,11 +27,11 @@ def cmd_build_index(reset: bool) -> None:
     indexer_main()
 
 
-def cmd_query(query: str, model: str, top_n: int, verbose: bool,
-              reranker_device: str = "auto") -> None:
+def cmd_query(query: str, model: str | None, provider: str, top_n: int,
+              verbose: bool, reranker_device: str = "auto") -> None:
     from rag.pipeline import Pipeline
     pipe = Pipeline(rerank_top_n=top_n, llm_model=model,
-                    reranker_device=reranker_device)
+                    provider=provider, reranker_device=reranker_device)
     result = pipe.ask(query)
 
     print(f"\n{'='*60}")
@@ -83,8 +83,11 @@ Examples:
 
     parser.add_argument("--reset",   action="store_true",
                         help="(with --build-index) Drop and recreate collection")
-    parser.add_argument("--model",   default="granite4:3b",
-                        help="Ollama model (default: granite4:3b)")
+    parser.add_argument("--model",   default=None,
+                        help="LLM model (default: qwen2.5:7b for local, gpt-oss-20b for openrouter)")
+    parser.add_argument("--provider", default="local",
+                        choices=["local", "openrouter"],
+                        help="LLM provider: local (Ollama) or openrouter (API)")
     parser.add_argument("--top-n",   type=int, default=5,
                         help="Chunks to retrieve (default: 5)")
     parser.add_argument("--verbose", action="store_true",
@@ -102,8 +105,8 @@ Examples:
     if args.build_index:
         cmd_build_index(reset=args.reset)
     elif args.query:
-        cmd_query(args.query, args.model, args.top_n, args.verbose,
-                  reranker_device=args.reranker_device)
+        cmd_query(args.query, args.model, args.provider, args.top_n,
+                  args.verbose, reranker_device=args.reranker_device)
     elif args.app:
         cmd_app(args.port, args.share)
 

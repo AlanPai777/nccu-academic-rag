@@ -1,5 +1,7 @@
 """
-embedder.py — Embedding via Ollama bge-m3 (Intel GPU accelerated, dense only).
+embedder.py — Embedding via Ollama (Intel GPU accelerated, dense only).
+
+Supports qwen3-embedding (default) or bge-m3 as embedding model.
 
 Usage:
     from rag.embedder import Embedder
@@ -16,13 +18,14 @@ from typing import Any
 
 
 OLLAMA_URL   = "http://localhost:11434"
-OLLAMA_MODEL = "bge-m3"
+OLLAMA_MODEL = "qwen3-embedding"
 
 
 class Embedder:
     """
-    Calls Ollama bge-m3 embedding API (Intel GPU accelerated).
-    Dense vectors only (1024-dim).
+    Calls Ollama embedding API (Intel GPU accelerated).
+    Default model: qwen3-embedding (1024-dim, #1 MTEB multilingual).
+    Uses keep_alive=0 to free memory immediately after embedding.
     """
 
     def __init__(self, batch_size: int = 32,
@@ -59,7 +62,7 @@ class Embedder:
     def _embed_one(self, text: str) -> list[float]:
         r = httpx.post(
             f"{self.ollama_url}/api/embed",
-            json={"model": self.model, "input": text},
+            json={"model": self.model, "input": text, "keep_alive": 0},
             timeout=60,
         )
         r.raise_for_status()
@@ -69,7 +72,7 @@ class Embedder:
         """Ollama /api/embed supports batch input."""
         r = httpx.post(
             f"{self.ollama_url}/api/embed",
-            json={"model": self.model, "input": texts},
+            json={"model": self.model, "input": texts, "keep_alive": 0},
             timeout=120,
         )
         r.raise_for_status()
@@ -119,7 +122,7 @@ if __name__ == "__main__":
         "How to apply for leave of absence?",
     ]
 
-    print("=== Embedder (Ollama bge-m3) quick test ===\n")
+    print(f"=== Embedder (Ollama {OLLAMA_MODEL}) quick test ===\n")
     emb = Embedder()
     result = emb.embed_batch(queries)
 

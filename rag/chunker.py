@@ -21,7 +21,7 @@ _HEADING_RE = re.compile(
 )
 
 MAX_HTML_CHUNK = 800    # characters
-OVERLAP_HTML   = 100    # characters of overlap between chunks
+OVERLAP_HTML   = 200    # characters of overlap (covers most markdown links)
 
 
 def chunk_html(text: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -114,11 +114,45 @@ def chunk_pdf(text: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^\)]*)\)")
+
+
+def _repair_markdown_links(text: str) -> str:
+    """
+    Remove broken markdown links at chunk boundaries.
+
+    Handles two cases:
+    1. Chunk starts with a partial link: ...url) remaining text
+    2. Chunk ends with a partial link: text [label](partial...
+    """
+    # Remove partial link at the start: e.g. "ome/path.pdf) rest of text"
+    # Look for a closing ')' without a matching '[...](' before it
+    text = re.sub(r"^[^\[\]\n]*?\)\s*", "", text, count=1)
+
+    # Remove partial link at the end: e.g. "some text [label](http://..."
+    # An incomplete markdown link where ')' is missing
+    match = re.search(r"\[[^\]]*\]\([^\)]*$", text)
+    if match:
+        text = text[:match.start()].rstrip()
+
+    # Also remove orphaned '[label]' at the very end (no '(' follows)
+    text = re.sub(r"\[[^\]]*\]$", "", text).rstrip()
+
+    return text
+
+
+def clean_for_embedding(text: str) -> str:
+    """Strip markdown link URLs, keeping only the link label text."""
+    return _MD_LINK_RE.sub(r"\1", text)
+
+
 def _make_chunk(text: str, metadata: dict[str, Any], index: int) -> dict[str, Any]:
     chunk = dict(metadata)   # shallow copy of parent metadata
+    text = _repair_markdown_links(text)
     chunk["text"] = text
+    chunk["text_clean"] = clean_for_embedding(text)
     chunk["chunk_index"] = index
-    chunk["chunk_len"] = len(text)
+    chunk["chunk_len"] = len(chunk["text_clean"])
     return chunk
 
 
@@ -137,6 +171,10 @@ if __name__ == "__main__":
 本系提供多樣化的課程，包括必修與選修科目。
 學生需完成 128 學分方可畢業。
 
+相關法規與表單
+[國立政治大學研究生學位考試要點](https://aca.nccu.edu.tw/download/rulesdata/law16A.pdf)
+[研究生學位論文繳交、畢業離校及延後畢業流程](https://aca.nccu.edu.tw/db/upload/學位考試及畢業離校流程.pdf)
+
 選課辦法
 
 每學期開學前兩週為加退選期間。
@@ -154,7 +192,8 @@ if __name__ == "__main__":
     chunks = chunk_html(sample_html, meta)
     print(f"HTML chunks: {len(chunks)}")
     for c in chunks:
-        print(f"  [{c['chunk_index']}] len={c['chunk_len']}  {c['text'][:60]!r}")
+        print(f"  [{c['chunk_index']}] len={c['chunk_len']}  text: {c['text'][:80]!r}")
+        print(f"              clean: {c['text_clean'][:80]!r}")
 
     sample_pdf = "政大教務處規定 " * 300  # ~2100 chars
     meta_pdf = {**meta, "source_type": "pdf"}

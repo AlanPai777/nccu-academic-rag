@@ -64,13 +64,23 @@ def process_record(rec: dict, base: Path) -> list[dict]:
         text = extract_html(fpath, meta["url"])
         if not text:
             return []
-        return chunk_html(text, meta)
+        chunks = chunk_html(text, meta)
+        # Tag short title-only chunks as navigation (still indexed, not skipped)
+        for chunk in chunks:
+            if len(chunk.get("text_clean", chunk["text"])) < 30:
+                chunk["chunk_type"] = "navigation"
+            else:
+                chunk["chunk_type"] = "content"
+        return chunks
 
     elif actual_type == "pdf":
         text = extract_pdf(fpath)
         if not text:
             return []
-        return chunk_pdf(text, meta)
+        chunks = chunk_pdf(text, meta)
+        for chunk in chunks:
+            chunk["chunk_type"] = "content"
+        return chunks
 
     return []
 
@@ -152,11 +162,13 @@ def main():
                     break
                 chunk = json.loads(line)
                 print(f"\n[Chunk {i}]")
-                print(f"  url    : {chunk['url']}")
-                print(f"  type   : {chunk['source_type']}")
-                print(f"  depth  : {chunk['depth']}")
-                print(f"  chars  : {chunk['chunk_len']}")
-                print(f"  text   : {chunk['text'][:200]!r}")
+                print(f"  url        : {chunk['url']}")
+                print(f"  type       : {chunk['source_type']}")
+                print(f"  chunk_type : {chunk.get('chunk_type', 'N/A')}")
+                print(f"  depth      : {chunk['depth']}")
+                print(f"  chars      : {chunk['chunk_len']}")
+                print(f"  text       : {chunk['text'][:200]!r}")
+                print(f"  text_clean : {chunk.get('text_clean', '')[:200]!r}")
 
 
 if __name__ == "__main__":

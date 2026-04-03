@@ -80,7 +80,7 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("""
         # 🎓 政大教務處智慧助理
         **資料來源**：國立政治大學教務處（aca.nccu.edu.tw）
-        支援中英文問答 · 由 granite4:3b + bge-m3 提供
+        支援中英文問答 · 由 qwen2.5:7b + qwen3-embedding 提供
         """)
 
         with gr.Row():
@@ -143,11 +143,17 @@ if __name__ == "__main__":
     parser.add_argument("--port",   type=int, default=7860)
     parser.add_argument("--share",  action="store_true",
                         help="Create public Gradio link")
+    parser.add_argument("--provider", default="local",
+                        choices=["local", "openrouter"],
+                        help="LLM provider: local (Ollama) or openrouter (API)")
     parser.add_argument("--no-browser", action="store_true",
                         help="Don't auto-open browser")
     args = parser.parse_args()
 
-    print("Loading pipeline (first query will load reranker model)…")
+    # Pre-create pipeline with chosen provider
+    global _pipeline
+    _pipeline = Pipeline(provider=args.provider)
+    print(f"Pipeline loaded (provider={args.provider}, first query will load reranker)…")
     demo = build_ui()
     demo.launch(
         server_port=args.port,

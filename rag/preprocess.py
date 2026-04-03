@@ -7,8 +7,51 @@ PDF:  uses pdfplumber; returns empty string if text < 100 chars (likely scanned)
 
 import re
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+
+def _node_to_text(node, base_url: str) -> str:
+    """
+    Recursively convert a BeautifulSoup node to plain text,
+    rendering <a href=...> tags as markdown [text](url) links.
+    Relative URLs are resolved against base_url.
+    """
+    if isinstance(node, NavigableString):
+        return str(node)
+
+    if not isinstance(node, Tag):
+        return ""
+
+    # Block-level tags: add newlines around their content
+    block_tags = {"p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+                  "br", "td", "th", "dt", "dd", "blockquote", "pre"}
+
+    if node.name == "a":
+        href = node.get("href", "").strip()
+        text = node.get_text(strip=True)
+        if href and text:
+            # Resolve relative URLs
+            if href.startswith(("http://", "https://")):
+                full_url = href
+            elif href.startswith("/") and base_url:
+                parsed = urlparse(base_url)
+                full_url = f"{parsed.scheme}://{parsed.netloc}{href}"
+            else:
+                full_url = urljoin(base_url, href) if base_url else href
+            return f"[{text}]({full_url})"
+        return text
+
+    parts = []
+    for child in node.children:
+        parts.append(_node_to_text(child, base_url))
+
+    content = "".join(parts)
+
+    if node.name in block_tags:
+        return f"\n{content}\n"
+    return content
 
 
 def extract_html(path: str | Path, url: str = "") -> str:
@@ -18,6 +61,7 @@ def extract_html(path: str | Path, url: str = "") -> str:
     Targets div.item-page (Joomla CMS content area).
     Falls back to <main>, then <body> if div.item-page is absent.
     Removes nav, footer, header, script, style, aside tags before extraction.
+    Preserves hyperlinks as markdown [text](url).
 
     Returns plain text with normalised whitespace.
     """
@@ -30,6 +74,13 @@ def extract_html(path: str | Path, url: str = "") -> str:
         soup = BeautifulSoup(raw, "lxml")
     except Exception:
         return ""
+
+    # Extract page title as fallback for empty/placeholder pages
+    # If no <title> tag, derive from URL filename
+    if soup.title and soup.title.string and soup.title.string.strip():
+        page_title = soup.title.string.strip()
+    else:
+        page_title = Path(url.rstrip("/").split("/")[-1]).stem if url else ""
 
     # Remove noise elements
     for tag in soup.find_all(["nav", "footer", "header", "script", "style", "aside"]):
@@ -48,12 +99,18 @@ def extract_html(path: str | Path, url: str = "") -> str:
     if not content:
         content = soup.find("body")
     if not content:
-        return ""
+        return page_title
 
-    text = content.get_text(separator="\n", strip=True)
+    text = _node_to_text(content, url)
     # Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    text = text.strip()
+
+    if "Blank Component" in text or not text:
+        # Joomla placeholder or empty page — fall back to page title
+        return page_title
+
+    return text
 
 
 def extract_pdf(path: str | Path) -> str:

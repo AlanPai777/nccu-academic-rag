@@ -8,8 +8,8 @@ pdfplumber
 python-docx
 openpyxl
 
-# RAG: Embedding & Reranking
-FlagEmbedding
+# RAG: Reranking (Jina Reranker v2 via sentence-transformers)
+sentence-transformers
 
 # RAG: Vector database
 qdrant-client

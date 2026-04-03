@@ -3,7 +3,7 @@ preprocess_all.py — Extract clean text from all crawled HTML and PDF files
 and write to output/extracted_texts.jsonl.
 
 Each line is a JSON object with:
-  url, title, source_type, category, text
+  url, title, source_type, category, depth, text
 
 Usage:
     python rag/preprocess_all.py           # process all files
@@ -72,6 +72,7 @@ def main():
                 "title":       rec.get("url", "").split("/")[-1] or rec.get("url", ""),
                 "source_type": source_type,
                 "category":    rec.get("category", ""),
+                "depth":       rec.get("depth"),
                 "text":        text,
             }
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

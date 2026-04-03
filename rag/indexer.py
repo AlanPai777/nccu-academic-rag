@@ -38,8 +38,8 @@ from qdrant_client.models import (
 from rag.embedder import Embedder
 
 # ── Constants ──────────────────────────────────────────────────────────────── #
-COLLECTION   = "nccu_aca"
-DENSE_DIM    = 1024          # bge-m3 dense output dimension
+COLLECTION   = "nccu_aca_v2_qwen3embedding"
+DENSE_DIM    = 1024          # qwen3-embedding dense output dimension
 BATCH_SIZE   = 32            # chunks per embed+upsert batch
 QDRANT_URL   = "http://localhost:6333"
 CHUNKS_PATH  = ROOT / "rag" / "chunks.jsonl"
@@ -63,7 +63,7 @@ def create_collection(client: QdrantClient) -> None:
             "dense": VectorParams(size=DENSE_DIM, distance=Distance.COSINE),
         },
     )
-    print(f"Collection '{COLLECTION}' created (dense only, Ollama bge-m3).")
+    print(f"Collection '{COLLECTION}' created (dense only, Ollama qwen3-embedding).")
 
 
 def drop_collection(client: QdrantClient) -> None:
@@ -77,6 +77,7 @@ def build_payload(chunk: dict) -> dict:
     """Select fields to store as Qdrant payload."""
     return {
         "text":        chunk.get("text", ""),
+        "text_clean":  chunk.get("text_clean", chunk.get("text", "")),
         "url":         chunk.get("url", ""),
         "title":       chunk.get("title", ""),
         "depth":       chunk.get("depth", 0),
@@ -85,6 +86,7 @@ def build_payload(chunk: dict) -> dict:
         "fetched_at":  chunk.get("fetched_at", ""),
         "chunk_index": chunk.get("chunk_index", 0),
         "chunk_len":   chunk.get("chunk_len", 0),
+        "chunk_type":  chunk.get("chunk_type", "content"),
     }
 
 
@@ -107,7 +109,7 @@ def index_chunks(client: QdrantClient, embedder: Embedder) -> int:
     upserted = 0
     for batch_start in range(0, total, BATCH_SIZE):
         batch = all_chunks[batch_start : batch_start + BATCH_SIZE]
-        texts = [c["text"] for c in batch]
+        texts = [c.get("text_clean", c["text"]) for c in batch]
 
         # Embed
         emb_result = embedder.embed_batch(texts)

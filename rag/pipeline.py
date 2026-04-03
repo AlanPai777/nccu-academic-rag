@@ -35,11 +35,12 @@ class Pipeline:
 
     def __init__(self,
                  rerank_top_n: int = 5,
-                 llm_model: str = "granite4:3b",
+                 llm_model: str | None = None,
+                 provider: str = "local",
                  reranker_device: str = "auto"):
         self.retriever = Retriever(rerank_top_n=rerank_top_n,
                                    reranker_device=reranker_device)
-        self.generator = Generator(model=llm_model)
+        self.generator = Generator(provider=provider, model=llm_model)
 
     def ask(self, query: str) -> dict:
         """
@@ -80,15 +81,19 @@ class Pipeline:
 def main() -> None:
     parser = argparse.ArgumentParser(description="NCCU RAG pipeline.")
     parser.add_argument("--query",   required=True, help="Question to ask")
-    parser.add_argument("--model",   default="granite4:3b",
-                        help="Ollama model name (default: granite4:3b)")
+    parser.add_argument("--model",   default=None,
+                        help="LLM model name (default: qwen2.5:7b for local, gpt-oss-20b for openrouter)")
+    parser.add_argument("--provider", default="local",
+                        choices=["local", "openrouter"],
+                        help="LLM provider: local (Ollama) or openrouter (API)")
     parser.add_argument("--top-n",   type=int, default=5,
                         help="Number of chunks to retrieve (default: 5)")
     parser.add_argument("--verbose", action="store_true",
                         help="Also print retrieved chunks")
     args = parser.parse_args()
 
-    pipe = Pipeline(rerank_top_n=args.top_n, llm_model=args.model)
+    pipe = Pipeline(rerank_top_n=args.top_n, llm_model=args.model,
+                    provider=args.provider)
     result = pipe.ask(args.query)
 
     print(f"\n{'='*60}")
