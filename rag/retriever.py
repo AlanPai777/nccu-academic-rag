@@ -33,7 +33,7 @@ from qdrant_client import QdrantClient
 from rag.embedder import Embedder
 
 # ── Constants ──────────────────────────────────────────────────────────────── #
-COLLECTION   = "nccu_aca_v2_qwen3embedding"
+COLLECTION   = "nccu_aca_v2_embeddinggemma"
 QDRANT_URL   = "http://localhost:6333"
 DENSE_TOP_K  = 30    # candidates from Qdrant (reduced from 50 for speed)
 RERANK_TOP_N = 5     # final results after reranking

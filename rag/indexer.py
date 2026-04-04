@@ -38,8 +38,8 @@ from qdrant_client.models import (
 from rag.embedder import Embedder
 
 # ── Constants ──────────────────────────────────────────────────────────────── #
-COLLECTION   = "nccu_aca_v2_qwen3embedding"
-DENSE_DIM    = 1024          # qwen3-embedding dense output dimension
+COLLECTION   = "nccu_aca_v2_embeddinggemma"
+DENSE_DIM    = 768           # embeddinggemma dense output dimension
 BATCH_SIZE   = 32            # chunks per embed+upsert batch
 QDRANT_URL   = "http://localhost:6333"
 CHUNKS_PATH  = ROOT / "rag" / "chunks.jsonl"

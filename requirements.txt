@@ -10,6 +10,7 @@ openpyxl
 
 # RAG: Reranking (Jina Reranker v2 via sentence-transformers)
 sentence-transformers
+einops
 
 # RAG: Vector database
 qdrant-client

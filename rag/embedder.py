@@ -1,13 +1,13 @@
 """
 embedder.py — Embedding via Ollama (Intel GPU accelerated, dense only).
 
-Supports qwen3-embedding (default) or bge-m3 as embedding model.
+Supports embeddinggemma (default), qwen3-embedding, or bge-m3 as embedding model.
 
 Usage:
     from rag.embedder import Embedder
     emb = Embedder()
     result = emb.embed_batch(["選課辦法", "graduation requirements"])
-    # result["dense"]  → list of 1024-dim float lists
+    # result["dense"]  → list of 768-dim float lists (embeddinggemma)
     # result["sparse"] → None (Ollama mode, dense only)
 """
 
@@ -17,14 +17,14 @@ import httpx
 from typing import Any
 
 
-OLLAMA_URL   = "http://localhost:11434"
-OLLAMA_MODEL = "qwen3-embedding"
+OLLAMA_URL   = "http://localhost:11435"  # standalone Ollama (CPU) for embedding
+OLLAMA_MODEL = "embeddinggemma"
 
 
 class Embedder:
     """
     Calls Ollama embedding API (Intel GPU accelerated).
-    Default model: qwen3-embedding (1024-dim, #1 MTEB multilingual).
+    Default model: embeddinggemma (768-dim, Gemma3-based).
     Uses keep_alive=0 to free memory immediately after embedding.
     """
 
@@ -73,7 +73,7 @@ class Embedder:
         r = httpx.post(
             f"{self.ollama_url}/api/embed",
             json={"model": self.model, "input": texts, "keep_alive": 0},
-            timeout=120,
+            timeout=600,
         )
         r.raise_for_status()
         return r.json()["embeddings"]
