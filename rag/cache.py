@@ -1,99 +1,188 @@
 """
-cache.py — Two-layer LRU cache for the RAG pipeline.
+cache.py — Two-layer persistent cache for the RAG pipeline (SQLite-backed).
 
 Layer 1 (response cache): query → full pipeline result (answer + sources + contexts)
 Layer 2 (retrieval cache): query → reranked context chunks (skips embed + search + rerank)
+
+Cache persists across process restarts via SQLite. Works for both CLI and web UI.
 
 Usage:
     from rag.cache import RAGCache
     cache = RAGCache(ttl_seconds=3600)
     cache.put_response("選課上限", result_dict)
-    cached = cache.get_response("選課上限")  # instant hit
+    cached = cache.get_response("選課上限")  # instant hit (even after restart)
 """
 
 from __future__ import annotations
 
-import copy
+import json
+import sqlite3
 import time
 import threading
 import unicodedata
-from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 
+class _CacheEncoder(json.JSONEncoder):
+    """Handle numpy float32/int types from reranker scores."""
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, (np.floating, np.integer)):
+                return float(obj)
+        except ImportError:
+            pass
+        return super().default(obj)
+
+# Default cache location: rag/cache.db (next to this file)
+DEFAULT_DB_PATH = Path(__file__).parent / "cache.db"
+
+
 def _normalize_query(query: str) -> str:
-    """Normalize query for cache key: strip, lowercase, normalize unicode."""
+    """Normalize query for cache key: strip, normalize unicode."""
     return unicodedata.normalize("NFKC", query.strip())
 
 
-class _LRUCache:
-    """Thread-safe LRU cache with TTL expiration."""
+class _SQLiteCache:
+    """Thread-safe SQLite-backed cache with TTL and max size."""
 
-    def __init__(self, maxsize: int = 200, ttl_seconds: int = 3600):
+    def __init__(self, db_path: Path, table: str,
+                 maxsize: int = 200, ttl_seconds: int = 3600):
+        self._db_path = str(db_path)
+        self._table = table
         self._maxsize = maxsize
         self._ttl = ttl_seconds
-        self._cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._table} (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+    def _conn(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path)
 
     def get(self, key: str) -> Any | None:
         with self._lock:
-            if key not in self._cache:
-                self.misses += 1
-                return None
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    f"SELECT value, created_at FROM {self._table} WHERE key = ?",
+                    (key,)
+                ).fetchone()
 
-            ts, value = self._cache[key]
+                if row is None:
+                    self.misses += 1
+                    return None
 
-            # Check TTL
-            if self._ttl > 0 and (time.time() - ts) > self._ttl:
-                del self._cache[key]
-                self.misses += 1
-                return None
+                value_json, created_at = row
 
-            # Move to end (most recently used)
-            self._cache.move_to_end(key)
-            self.hits += 1
-            return copy.deepcopy(value)
+                # Check TTL
+                if self._ttl > 0 and (time.time() - created_at) > self._ttl:
+                    conn.execute(f"DELETE FROM {self._table} WHERE key = ?", (key,))
+                    conn.commit()
+                    self.misses += 1
+                    return None
+
+                self.hits += 1
+                return json.loads(value_json)
+            finally:
+                conn.close()
 
     def put(self, key: str, value: Any) -> None:
         with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self._cache[key] = (time.time(), copy.deepcopy(value))
-            else:
-                if len(self._cache) >= self._maxsize:
-                    self._cache.popitem(last=False)  # evict oldest
-                self._cache[key] = (time.time(), copy.deepcopy(value))
+            conn = self._conn()
+            try:
+                value_json = json.dumps(value, ensure_ascii=False, cls=_CacheEncoder)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {self._table} (key, value, created_at) "
+                    f"VALUES (?, ?, ?)",
+                    (key, value_json, time.time())
+                )
+
+                # Evict oldest if over maxsize
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM {self._table}"
+                ).fetchone()[0]
+                if count > self._maxsize:
+                    excess = count - self._maxsize
+                    conn.execute(
+                        f"DELETE FROM {self._table} WHERE key IN "
+                        f"(SELECT key FROM {self._table} ORDER BY created_at ASC LIMIT ?)",
+                        (excess,)
+                    )
+
+                conn.commit()
+            finally:
+                conn.close()
 
     def clear(self) -> None:
         with self._lock:
-            self._cache.clear()
+            conn = self._conn()
+            try:
+                conn.execute(f"DELETE FROM {self._table}")
+                conn.commit()
+            finally:
+                conn.close()
             self.hits = 0
             self.misses = 0
 
     def size(self) -> int:
         with self._lock:
-            return len(self._cache)
+            conn = self._conn()
+            try:
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM {self._table}"
+                ).fetchone()[0]
+
+                # Exclude expired entries from count
+                if self._ttl > 0:
+                    cutoff = time.time() - self._ttl
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM {self._table} WHERE created_at > ?",
+                        (cutoff,)
+                    ).fetchone()[0]
+
+                return count
+            finally:
+                conn.close()
 
 
 class RAGCache:
-    """Two-layer cache for the RAG pipeline.
+    """Two-layer persistent cache for the RAG pipeline.
 
     Layer 1 — Response cache: stores full pipeline results (answer + sources).
               Hit = skip everything, return instantly.
     Layer 2 — Retrieval cache: stores reranked context chunks.
               Hit = skip embed + search + rerank, only run LLM generation.
+
+    Backed by SQLite — cache persists across process restarts.
     """
 
     def __init__(self,
                  response_maxsize: int = 200,
                  retrieval_maxsize: int = 200,
-                 ttl_seconds: int = 3600):
-        self._response_cache = _LRUCache(maxsize=response_maxsize,
-                                          ttl_seconds=ttl_seconds)
-        self._retrieval_cache = _LRUCache(maxsize=retrieval_maxsize,
-                                           ttl_seconds=ttl_seconds)
+                 ttl_seconds: int = 3600,
+                 db_path: Path | str = DEFAULT_DB_PATH):
+        db_path = Path(db_path)
+        self._response_cache = _SQLiteCache(
+            db_path=db_path, table="response_cache",
+            maxsize=response_maxsize, ttl_seconds=ttl_seconds)
+        self._retrieval_cache = _SQLiteCache(
+            db_path=db_path, table="retrieval_cache",
+            maxsize=retrieval_maxsize, ttl_seconds=ttl_seconds)
 
     def get_response(self, query: str) -> dict | None:
         """Check response cache. Returns full pipeline result or None."""
@@ -139,59 +228,80 @@ class RAGCache:
 # ── Quick test ─────────────────────────────────────────────────────────────── #
 
 if __name__ == "__main__":
-    print("=== RAGCache quick test ===\n")
+    import tempfile
+    import os
 
-    cache = RAGCache(response_maxsize=3, retrieval_maxsize=3, ttl_seconds=2)
+    print("=== RAGCache (SQLite) quick test ===\n")
 
-    # Test response cache
-    cache.put_response("選課上限", {"answer": "25學分", "sources": []})
-    result = cache.get_response("選課上限")
-    assert result is not None and result["answer"] == "25學分"
-    print("[PASS] Response cache hit")
+    # Use temp file so tests don't pollute the real cache
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
 
-    result = cache.get_response("畢業學分")
-    assert result is None
-    print("[PASS] Response cache miss")
+    try:
+        cache = RAGCache(response_maxsize=3, retrieval_maxsize=3,
+                         ttl_seconds=2, db_path=tmp_path)
 
-    # Test retrieval cache
-    cache.put_retrieval("選課上限", [{"text": "chunk1"}, {"text": "chunk2"}])
-    contexts = cache.get_retrieval("選課上限")
-    assert contexts is not None and len(contexts) == 2
-    print("[PASS] Retrieval cache hit")
+        # Test response cache
+        cache.put_response("選課上限", {"answer": "25學分", "sources": []})
+        result = cache.get_response("選課上限")
+        assert result is not None and result["answer"] == "25學分"
+        print("[PASS] Response cache hit")
 
-    # Test query normalization
-    cache.put_response("  選課上限  ", {"answer": "normalized"})
-    result = cache.get_response("選課上限")
-    assert result is not None and result["answer"] == "normalized"
-    print("[PASS] Query normalization")
+        result = cache.get_response("畢業學分")
+        assert result is None
+        print("[PASS] Response cache miss")
 
-    # Test LRU eviction (maxsize=3)
-    cache.put_response("q1", {"answer": "a1"})
-    cache.put_response("q2", {"answer": "a2"})
-    cache.put_response("q3", {"answer": "a3"})
-    cache.put_response("q4", {"answer": "a4"})  # should evict oldest
-    assert cache.get_response("選課上限") is None  # evicted
-    assert cache.get_response("q4") is not None
-    print("[PASS] LRU eviction")
+        # Test retrieval cache
+        cache.put_retrieval("選課上限", [{"text": "chunk1"}, {"text": "chunk2"}])
+        contexts = cache.get_retrieval("選課上限")
+        assert contexts is not None and len(contexts) == 2
+        print("[PASS] Retrieval cache hit")
 
-    # Test TTL expiration
-    import time as _time
-    cache2 = RAGCache(ttl_seconds=1)
-    cache2.put_response("ttl_test", {"answer": "expires"})
-    assert cache2.get_response("ttl_test") is not None
-    _time.sleep(1.5)
-    assert cache2.get_response("ttl_test") is None
-    print("[PASS] TTL expiration")
+        # Test query normalization
+        cache.put_response("  選課上限  ", {"answer": "normalized"})
+        result = cache.get_response("選課上限")
+        assert result is not None and result["answer"] == "normalized"
+        print("[PASS] Query normalization")
 
-    # Test stats
-    stats = cache.stats()
-    print(f"\nStats: {stats}")
-    print(f"  Response: {stats['response']['hits']} hits, {stats['response']['misses']} misses")
-    print(f"  Retrieval: {stats['retrieval']['hits']} hits, {stats['retrieval']['misses']} misses")
+        # Test max size eviction
+        cache.put_response("q1", {"answer": "a1"})
+        cache.put_response("q2", {"answer": "a2"})
+        cache.put_response("q3", {"answer": "a3"})
+        cache.put_response("q4", {"answer": "a4"})  # should evict oldest
+        assert cache.get_response("選課上限") is None  # evicted
+        assert cache.get_response("q4") is not None
+        print("[PASS] Max size eviction")
 
-    # Test clear
-    cache.clear()
-    assert cache.stats()["response"]["size"] == 0
-    print("[PASS] Cache clear")
+        # Test TTL expiration
+        cache2 = RAGCache(ttl_seconds=1, db_path=tmp_path + ".ttl")
+        cache2.put_response("ttl_test", {"answer": "expires"})
+        assert cache2.get_response("ttl_test") is not None
+        time.sleep(1.5)
+        assert cache2.get_response("ttl_test") is None
+        print("[PASS] TTL expiration")
 
-    print("\n=== All tests passed ===")
+        # Test persistence across instances
+        cache3 = RAGCache(response_maxsize=10, ttl_seconds=3600, db_path=tmp_path)
+        result = cache3.get_response("q4")
+        assert result is not None and result["answer"] == "a4"
+        print("[PASS] Persistence across restarts")
+
+        # Test stats
+        stats = cache.stats()
+        print(f"\nStats: {stats}")
+        print(f"  Response: {stats['response']['hits']} hits, {stats['response']['misses']} misses")
+        print(f"  Retrieval: {stats['retrieval']['hits']} hits, {stats['retrieval']['misses']} misses")
+
+        # Test clear
+        cache.clear()
+        assert cache.stats()["response"]["size"] == 0
+        print("[PASS] Cache clear")
+
+        print("\n=== All tests passed ===")
+
+    finally:
+        os.unlink(tmp_path)
+        ttl_path = tmp_path + ".ttl"
+        if os.path.exists(ttl_path):
+            os.unlink(ttl_path)

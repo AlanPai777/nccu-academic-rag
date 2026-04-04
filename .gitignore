@@ -3,6 +3,7 @@ output/
 
 # Generated RAG data (regeneratable from output/)
 rag/chunks.jsonl
+rag/cache.db
 
 # Python
 venv/
