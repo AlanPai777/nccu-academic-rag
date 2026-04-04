@@ -18,13 +18,12 @@ import gradio as gr
 from rag.pipeline import Pipeline
 
 # ── Global pipeline instance (loaded once) ─────────────────────────────────── #
-_pipeline: Pipeline | None = None
+_state = {"pipeline": None}
 
 def get_pipeline() -> Pipeline:
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = Pipeline()
-    return _pipeline
+    if _state["pipeline"] is None:
+        _state["pipeline"] = Pipeline()
+    return _state["pipeline"]
 
 
 # ── Core answer function ───────────────────────────────────────────────────── #
@@ -47,6 +46,9 @@ def answer(query: str, history: list[list[str]]) -> tuple[str, list[list[str]], 
     result = pipe.ask(query.strip())
 
     ans = result["answer"]
+    cache_hit = result.get("cache_hit")
+    if cache_hit:
+        ans = f"⚡ *Cache hit: {cache_hit}*\n\n{ans}"
 
     # Format sources
     if result["sources"]:
@@ -72,6 +74,13 @@ def clear_all():
     return [], "", ""
 
 
+def clear_cache():
+    pipe = get_pipeline()
+    pipe.cache_clear()
+    stats = pipe.cache_stats()
+    return f"Cache cleared. Stats reset: {stats}"
+
+
 # ── Gradio UI ──────────────────────────────────────────────────────────────── #
 
 def build_ui() -> gr.Blocks:
@@ -80,7 +89,7 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("""
         # 🎓 政大教務處智慧助理
         **資料來源**：國立政治大學教務處（aca.nccu.edu.tw）
-        支援中英文問答 · 由 qwen2.5:7b + qwen3-embedding 提供
+        支援中英文問答 · 由 qwen2.5:7b + embeddinggemma 提供
         """)
 
         with gr.Row():
@@ -98,12 +107,18 @@ def build_ui() -> gr.Blocks:
                         autofocus=True,
                     )
                     submit_btn = gr.Button("送出", variant="primary", scale=1)
-                clear_btn = gr.Button("清除對話", variant="secondary")
+                with gr.Row():
+                    clear_btn = gr.Button("清除對話", variant="secondary")
+                    cache_btn = gr.Button("清除快取", variant="secondary")
 
             with gr.Column(scale=1):
                 sources_box = gr.Markdown(
                     value="*送出問題後，參考來源會顯示在這裡*",
                     label="參考來源",
+                )
+                cache_status = gr.Markdown(
+                    value="",
+                    label="快取狀態",
                 )
                 gr.Markdown("""
                 ---
@@ -130,6 +145,10 @@ def build_ui() -> gr.Blocks:
             fn=clear_all,
             outputs=[chatbot, query_box, sources_box],
         )
+        cache_btn.click(
+            fn=clear_cache,
+            outputs=[cache_status],
+        )
 
     return demo
 
@@ -151,8 +170,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Pre-create pipeline with chosen provider
-    global _pipeline
-    _pipeline = Pipeline(provider=args.provider)
+    _state["pipeline"] = Pipeline(provider=args.provider)
     print(f"Pipeline loaded (provider={args.provider}, first query will load reranker)…")
     demo = build_ui()
     demo.launch(

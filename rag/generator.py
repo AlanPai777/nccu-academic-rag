@@ -152,7 +152,7 @@ class Generator:
             r = httpx.post(
                 f"{self.ollama_url}/api/chat",
                 json=payload,
-                timeout=120,
+                timeout=300,  # 5 min: model loading (~70s) + generation (~40s)
             )
             r.raise_for_status()
             return r.json()["message"]["content"].strip()

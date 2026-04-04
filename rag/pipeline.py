@@ -25,22 +25,26 @@ sys.path.insert(0, str(ROOT))
 
 from rag.retriever import Retriever
 from rag.generator import Generator
+from rag.cache import RAGCache
 
 
 class Pipeline:
     """
     Full RAG pipeline:
-        query → Retriever (embed + search + rerank) → Generator (LLM)
+        query → Cache check → Retriever (embed + search + rerank) → Generator (LLM)
     """
 
     def __init__(self,
                  rerank_top_n: int = 5,
                  llm_model: str | None = None,
                  provider: str = "local",
-                 reranker_device: str = "auto"):
+                 reranker_device: str = "auto",
+                 enable_cache: bool = True,
+                 cache_ttl: int = 3600):
         self.retriever = Retriever(rerank_top_n=rerank_top_n,
                                    reranker_device=reranker_device)
         self.generator = Generator(provider=provider, model=llm_model)
+        self.cache = RAGCache(ttl_seconds=cache_ttl) if enable_cache else None
 
     def ask(self, query: str) -> dict:
         """
@@ -48,32 +52,67 @@ class Pipeline:
 
         Returns:
             {
-                "query":   str,
-                "answer":  str,
-                "sources": list[{index, url, title, source_type}],
-                "contexts": list[dict]   # raw retrieved chunks
+                "query":     str,
+                "answer":    str,
+                "sources":   list[{index, url, title, source_type}],
+                "contexts":  list[dict],   # raw retrieved chunks
+                "cache_hit": str | None     # "response", "retrieval", or None
             }
         """
-        # Step 1: Retrieve relevant chunks
-        contexts = self.retriever.retrieve(query)
+        # Layer 1: Check response cache (skip everything)
+        if self.cache:
+            cached = self.cache.get_response(query)
+            if cached is not None:
+                cached["cache_hit"] = "response"
+                return cached
+
+        # Layer 2: Check retrieval cache (skip embed + search + rerank)
+        contexts = None
+        cache_hit = None
+        if self.cache:
+            contexts = self.cache.get_retrieval(query)
+            if contexts is not None:
+                cache_hit = "retrieval"
+
+        # Full retrieval on cache miss
+        if contexts is None:
+            contexts = self.retriever.retrieve(query)
 
         if not contexts:
             return {
-                "query":    query,
-                "answer":   "抱歉，資料庫中找不到與此問題相關的內容。",
-                "sources":  [],
-                "contexts": [],
+                "query":     query,
+                "answer":    "抱歉，資料庫中找不到與此問題相關的內容。",
+                "sources":   [],
+                "contexts":  [],
+                "cache_hit": None,
             }
 
-        # Step 2: Generate answer
+        # Generate answer
         result = self.generator.generate(query, contexts)
 
-        return {
-            "query":    query,
-            "answer":   result["answer"],
-            "sources":  result["sources"],
-            "contexts": contexts,
+        full_result = {
+            "query":     query,
+            "answer":    result["answer"],
+            "sources":   result["sources"],
+            "contexts":  contexts,
+            "cache_hit": cache_hit,
         }
+
+        # Store in caches
+        if self.cache:
+            self.cache.put_retrieval(query, contexts)
+            self.cache.put_response(query, full_result)
+
+        return full_result
+
+    def cache_stats(self) -> dict | None:
+        """Return cache statistics, or None if caching is disabled."""
+        return self.cache.stats() if self.cache else None
+
+    def cache_clear(self) -> None:
+        """Clear all caches."""
+        if self.cache:
+            self.cache.clear()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────── #

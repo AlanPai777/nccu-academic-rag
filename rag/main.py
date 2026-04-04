@@ -28,16 +28,23 @@ def cmd_build_index(reset: bool) -> None:
 
 
 def cmd_query(query: str, model: str | None, provider: str, top_n: int,
-              verbose: bool, reranker_device: str = "auto") -> None:
+              verbose: bool, reranker_device: str = "auto",
+              no_cache: bool = False) -> None:
     from rag.pipeline import Pipeline
     pipe = Pipeline(rerank_top_n=top_n, llm_model=model,
-                    provider=provider, reranker_device=reranker_device)
+                    provider=provider, reranker_device=reranker_device,
+                    enable_cache=not no_cache)
     result = pipe.ask(query)
 
     print(f"\n{'='*60}")
     print(f"問題：{result['query']}")
     print(f"{'='*60}\n")
     print(result["answer"])
+
+    cache_hit = result.get("cache_hit")
+    if cache_hit:
+        print(f"\n⚡ Cache hit: {cache_hit}")
+
     print(f"\n{'─'*60}")
     print("參考來源：")
     for s in result["sources"]:
@@ -99,6 +106,8 @@ Examples:
                         help="(with --app) Port (default: 7860)")
     parser.add_argument("--share",   action="store_true",
                         help="(with --app) Create public Gradio link")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="(with --query) Disable caching")
 
     args = parser.parse_args()
 
@@ -106,7 +115,8 @@ Examples:
         cmd_build_index(reset=args.reset)
     elif args.query:
         cmd_query(args.query, args.model, args.provider, args.top_n,
-                  args.verbose, reranker_device=args.reranker_device)
+                  args.verbose, reranker_device=args.reranker_device,
+                  no_cache=args.no_cache)
     elif args.app:
         cmd_app(args.port, args.share)
 
