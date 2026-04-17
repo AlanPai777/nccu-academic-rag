@@ -15,6 +15,9 @@ einops
 # RAG: Vector database
 qdrant-client
 
+# RAG: Keyword search (FTS5 Chinese segmentation)
+jieba
+
 # RAG: Utilities
 langdetect
 tiktoken

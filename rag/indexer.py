@@ -36,6 +36,7 @@ from qdrant_client.models import (
 )
 
 from rag.embedder import Embedder
+from rag.keyword_store import KeywordStore
 
 # ── Constants ──────────────────────────────────────────────────────────────── #
 COLLECTION   = "nccu_aca_v2_embeddinggemma"
@@ -150,13 +151,26 @@ def print_stats(client: QdrantClient) -> None:
         print(f"  Vectors count    : {vectors_count}")
 
 
+def build_fts_index(force: bool = False) -> int:
+    """Build FTS5 keyword index from chunks.jsonl."""
+    ks = KeywordStore()
+    return ks.build_index(chunks_path=CHUNKS_PATH, force=force)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Index chunks into Qdrant.")
     parser.add_argument("--verify", action="store_true",
                         help="Only print collection stats, skip indexing")
     parser.add_argument("--reset",  action="store_true",
                         help="Drop and recreate collection before indexing")
+    parser.add_argument("--build-fts", action="store_true",
+                        help="Build FTS5 keyword index only (skip Qdrant)")
     args = parser.parse_args()
+
+    # FTS-only mode
+    if args.build_fts:
+        build_fts_index(force=args.reset)
+        return
 
     client = get_client()
 
@@ -166,6 +180,8 @@ def main() -> None:
             print(f"Collection '{COLLECTION}' does not exist yet.")
         else:
             print_stats(client)
+        ks = KeywordStore()
+        print(f"\n  FTS5 index     : {'yes' if ks.exists() else 'no'} ({ks.count()} chunks)")
         return
 
     # Optionally drop
@@ -178,6 +194,10 @@ def main() -> None:
 
     embedder = Embedder(batch_size=BATCH_SIZE)
     upserted = index_chunks(client, embedder)
+
+    # Also build FTS5 index
+    print(f"\nBuilding FTS5 keyword index...")
+    build_fts_index(force=args.reset)
 
     print(f"\n{'='*50}")
     print(f"Indexing complete. Total points upserted: {upserted}")

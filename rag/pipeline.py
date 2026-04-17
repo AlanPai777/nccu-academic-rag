@@ -40,9 +40,11 @@ class Pipeline:
                  provider: str = "local",
                  reranker_device: str = "auto",
                  enable_cache: bool = True,
-                 cache_ttl: int = 3600):
+                 cache_ttl: int = 3600,
+                 enable_keyword: bool = True):
         self.retriever = Retriever(rerank_top_n=rerank_top_n,
-                                   reranker_device=reranker_device)
+                                   reranker_device=reranker_device,
+                                   enable_keyword=enable_keyword)
         self.generator = Generator(provider=provider, model=llm_model)
         self.cache = RAGCache(ttl_seconds=cache_ttl) if enable_cache else None
 

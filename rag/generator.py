@@ -35,42 +35,54 @@ SYSTEM_PROMPT = """你是國立政治大學教務處的智慧助理。
 5. 若參考資料中包含連結，請在回答中保留相關連結供使用者參考"""
 
 
-def _build_context(contexts: list[dict]) -> str:
+def _build_sources(contexts: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    """Build deduplicated source list and URL-to-source-number mapping.
+
+    Sources are deduplicated by URL with sequential numbering [1]..[M].
+    The url_to_source mapping lets _build_context tag each chunk with
+    its source number, so multiple chunks from the same URL share one number.
+
+    Returns:
+        (sources, url_to_source)
+    """
+    seen = set()
+    sources = []
+    url_to_source: dict[str, int] = {}
+    for c in contexts:
+        url = c.get("url", "")
+        if url and url not in seen:
+            seen.add(url)
+            idx = len(sources) + 1
+            url_to_source[url] = idx
+            sources.append({
+                "index":       idx,
+                "url":         url,
+                "title":       c.get("title", url.split("/")[-1]),
+                "source_type": c.get("source_type", ""),
+            })
+    return sources, url_to_source
+
+
+def _build_context(contexts: list[dict], url_to_source: dict[str, int]) -> str:
     """Format retrieved chunks into a context string for the LLM.
 
+    Each chunk is tagged with its URL's source number from url_to_source,
+    so multiple chunks from the same page share the same [N] label.
     Uses text_clean (URL-stripped) to maximise content within MAX_CTX_CHARS.
-    The original text with links is still available in the sources output.
     """
     parts = []
     total = 0
-    for i, c in enumerate(contexts):
-        # Prefer text_clean (no URLs) for LLM context efficiency
+    for c in contexts:
         text = c.get("text_clean", c.get("text", "")).strip()
         if not text:
             continue
-        entry = f"[{i+1}] {text}"
+        src_num = url_to_source.get(c.get("url", ""), "?")
+        entry = f"[{src_num}] {text}"
         if total + len(entry) > MAX_CTX_CHARS:
             break
         parts.append(entry)
         total += len(entry)
     return "\n\n".join(parts)
-
-
-def _build_sources(contexts: list[dict]) -> list[dict]:
-    """Deduplicate and format source metadata."""
-    seen = set()
-    sources = []
-    for i, c in enumerate(contexts):
-        url = c.get("url", "")
-        if url and url not in seen:
-            seen.add(url)
-            sources.append({
-                "index":       i + 1,
-                "url":         url,
-                "title":       c.get("title", url.split("/")[-1]),
-                "source_type": c.get("source_type", ""),
-            })
-    return sources
 
 
 class Generator:
@@ -118,8 +130,8 @@ class Generator:
                 "sources": list[{index, url, title, source_type}]
             }
         """
-        context_str = _build_context(contexts)
-        sources     = _build_sources(contexts)
+        sources, url_to_source = _build_sources(contexts)
+        context_str = _build_context(contexts, url_to_source)
 
         user_prompt = (
             f"參考資料：\n{context_str}\n\n"

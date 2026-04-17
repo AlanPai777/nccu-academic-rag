@@ -2,8 +2,9 @@
 main.py — Unified CLI entry point for the NCCU RAG system.
 
 Commands:
-    python rag/main.py --build-index         # embed + index all chunks
+    python rag/main.py --build-index         # embed + index all chunks (Qdrant + FTS5)
     python rag/main.py --build-index --reset # drop collection and rebuild
+    python rag/main.py --build-fts           # build FTS5 keyword index only (fast, no embedding)
     python rag/main.py --query "..."         # single Q&A in terminal
     python rag/main.py --app                 # launch Gradio web UI
     python rag/main.py --app --port 7861     # custom port
@@ -27,13 +28,19 @@ def cmd_build_index(reset: bool) -> None:
     indexer_main()
 
 
+def cmd_build_fts(reset: bool) -> None:
+    from rag.indexer import build_fts_index
+    build_fts_index(force=reset)
+
+
 def cmd_query(query: str, model: str | None, provider: str, top_n: int,
               verbose: bool, reranker_device: str = "auto",
-              no_cache: bool = False) -> None:
+              no_cache: bool = False, no_keyword: bool = False) -> None:
     from rag.pipeline import Pipeline
     pipe = Pipeline(rerank_top_n=top_n, llm_model=model,
                     provider=provider, reranker_device=reranker_device,
-                    enable_cache=not no_cache)
+                    enable_cache=not no_cache,
+                    enable_keyword=not no_keyword)
     result = pipe.ask(query)
 
     print(f"\n{'='*60}")
@@ -82,7 +89,9 @@ Examples:
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--build-index", action="store_true",
-                      help="Build Qdrant index from chunks.jsonl")
+                      help="Build Qdrant + FTS5 index from chunks.jsonl")
+    mode.add_argument("--build-fts", action="store_true",
+                      help="Build FTS5 keyword index only (fast, no embedding)")
     mode.add_argument("--query", type=str, metavar="QUESTION",
                       help="Ask a single question")
     mode.add_argument("--app", action="store_true",
@@ -108,15 +117,19 @@ Examples:
                         help="(with --app) Create public Gradio link")
     parser.add_argument("--no-cache", action="store_true",
                         help="(with --query) Disable caching")
+    parser.add_argument("--no-keyword", action="store_true",
+                        help="(with --query) Disable keyword search (dense only)")
 
     args = parser.parse_args()
 
     if args.build_index:
         cmd_build_index(reset=args.reset)
+    elif args.build_fts:
+        cmd_build_fts(reset=args.reset)
     elif args.query:
         cmd_query(args.query, args.model, args.provider, args.top_n,
                   args.verbose, reranker_device=args.reranker_device,
-                  no_cache=args.no_cache)
+                  no_cache=args.no_cache, no_keyword=args.no_keyword)
     elif args.app:
         cmd_app(args.port, args.share)
 
