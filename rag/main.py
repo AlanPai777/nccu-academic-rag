@@ -34,11 +34,11 @@ def cmd_build_fts(reset: bool) -> None:
 
 
 def cmd_query(query: str, model: str | None, provider: str, top_n: int,
-              verbose: bool, reranker_device: str = "auto",
-              no_cache: bool = False, no_keyword: bool = False) -> None:
+              verbose: bool, no_cache: bool = False,
+              no_keyword: bool = False) -> None:
     from rag.pipeline import Pipeline
     pipe = Pipeline(rerank_top_n=top_n, llm_model=model,
-                    provider=provider, reranker_device=reranker_device,
+                    provider=provider,
                     enable_cache=not no_cache,
                     enable_keyword=not no_keyword)
     result = pipe.ask(query)
@@ -108,9 +108,6 @@ Examples:
                         help="Chunks to retrieve (default: 5)")
     parser.add_argument("--verbose", action="store_true",
                         help="(with --query) Print retrieved chunks")
-    parser.add_argument("--reranker-device", default="auto",
-                        choices=["auto", "cpu", "xpu", "cuda"],
-                        help="Reranker device: auto / cpu / xpu(Intel GPU) / cuda(NVIDIA)")
     parser.add_argument("--port",    type=int, default=7860,
                         help="(with --app) Port (default: 7860)")
     parser.add_argument("--share",   action="store_true",
@@ -128,8 +125,8 @@ Examples:
         cmd_build_fts(reset=args.reset)
     elif args.query:
         cmd_query(args.query, args.model, args.provider, args.top_n,
-                  args.verbose, reranker_device=args.reranker_device,
-                  no_cache=args.no_cache, no_keyword=args.no_keyword)
+                  args.verbose, no_cache=args.no_cache,
+                  no_keyword=args.no_keyword)
     elif args.app:
         cmd_app(args.port, args.share)
 

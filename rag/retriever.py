@@ -1,21 +1,21 @@
 """
-retriever.py — Hybrid retrieval: dense search + FTS5 keyword search + reranking.
+retriever.py — Hybrid retrieval: dense search + FTS5 keyword search + RRF fusion.
 
 Pipeline:
     query → Qdrant dense search (top-25)
           + FTS5 keyword search (top-15)
-          → merge & deduplicate
-          → Jina Reranker v2 cross-encoder rerank → top-5 chunks
+          → Reciprocal Rank Fusion (RRF, k=60) → top-5 chunks
 
-The hybrid approach improves recall for exact-match terms (course codes,
-regulation names) that dense search alone might miss.
+RRF replaces the Jina CrossEncoder reranker (was ~9-10 min/query CPU).
+Expected latency: <100ms total retrieval. See docs/rerank-replacement.md.
 
 Usage:
     from rag.retriever import Retriever
     ret = Retriever()                          # hybrid (default)
     ret = Retriever(enable_keyword=False)      # dense only
     results = ret.retrieve("選課辦法是什麼？")
-    # results → list of {text, text_clean, url, title, score, category, source_type}
+    # results → list of {text, text_clean, url, title, rerank_score,
+    #                     category, source_type, retrieval_source}
 
 CLI:
     python rag/retriever.py --query "選課辦法"
@@ -37,93 +37,33 @@ from rag.embedder import Embedder
 from rag.keyword_store import KeywordStore
 
 # ── Constants ──────────────────────────────────────────────────────────────── #
-COLLECTION     = "nccu_aca_v2_embeddinggemma"
-QDRANT_URL     = "http://localhost:6333"
-DENSE_TOP_K    = 25    # candidates from Qdrant (was 30, reduced for hybrid budget)
-KEYWORD_TOP_K  = 15    # candidates from FTS5 keyword search
-MAX_CANDIDATES = 30    # cap total candidates before reranking
-RERANK_TOP_N   = 5     # final results after reranking
-RERANKER_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
-
-# device 選項說明：
-#   "auto" → 自動偵測（有 CUDA 用 CUDA，否則 CPU）
-#   "cpu"  → 強制 CPU（最穩定）
-#   "xpu"  → Intel GPU via ipex-llm
-#   "cuda" → NVIDIA GPU
-RERANKER_DEVICE = "auto"
-
-
-# ── Reranker ───────────────────────────────────────────────────────────────── #
-class Reranker:
-    """Lazy-load Jina Reranker v2 cross-encoder via sentence-transformers.
-
-    Args:
-        device: 運算裝置，"auto" / "cpu" / "xpu" / "cuda"
-    """
-
-    def __init__(self, device: str = RERANKER_DEVICE):
-        self.device = device
-        self._model = None
-
-    def _load(self) -> None:
-        if self._model is not None:
-            return
-        try:
-            from sentence_transformers import CrossEncoder
-        except ImportError as e:
-            raise ImportError(
-                "sentence-transformers is required. Install with:\n"
-                "  pip install sentence-transformers"
-            ) from e
-
-        device_str = f" (device={self.device})" if self.device != "auto" else ""
-        print(f"Loading {RERANKER_MODEL}{device_str}…")
-
-        kwargs: dict = {}
-        if self.device != "auto":
-            kwargs["device"] = self.device
-
-        self._model = CrossEncoder(RERANKER_MODEL, trust_remote_code=True, **kwargs)
-        print(f"Reranker loaded on {self.device}.")
-
-    def rerank(self, query: str, passages: list[str],
-               top_n: int = RERANK_TOP_N) -> list[tuple[int, float]]:
-        """
-        Batch-score [query, passage] pairs using cross-encoder.
-        Returns list of (original_index, score) sorted by score desc, top_n.
-        """
-        self._load()
-        pairs = [(query, p) for p in passages]
-        scores = self._model.predict(pairs, show_progress_bar=False)
-        if not hasattr(scores, '__len__'):
-            scores = [scores]
-        indexed = sorted(enumerate(scores), key=lambda x: -x[1])
-        return indexed[:top_n]
+COLLECTION    = "nccu_aca_v2_embeddinggemma"
+QDRANT_URL    = "http://localhost:6333"
+DENSE_TOP_K   = 25   # candidates from Qdrant
+KEYWORD_TOP_K = 15   # candidates from FTS5 keyword search
+RERANK_TOP_N  = 5    # final results after RRF
+RRF_K         = 60   # RRF constant (standard; higher = flatter ranking)
 
 
 # ── Retriever ──────────────────────────────────────────────────────────────── #
 class Retriever:
     """
     Full retrieval pipeline:
-        embed → dense search (+ keyword search) → merge → rerank → top-N results
+        embed → dense search (+ keyword search) → RRF fusion → top-N results
     """
 
     def __init__(self,
                  qdrant_url: str = QDRANT_URL,
                  dense_top_k: int = DENSE_TOP_K,
                  keyword_top_k: int = KEYWORD_TOP_K,
-                 max_candidates: int = MAX_CANDIDATES,
                  rerank_top_n: int = RERANK_TOP_N,
-                 reranker_device: str = RERANKER_DEVICE,
                  enable_keyword: bool = True):
-        self.dense_top_k    = dense_top_k
-        self.keyword_top_k  = keyword_top_k
-        self.max_candidates = max_candidates
-        self.rerank_top_n   = rerank_top_n
+        self.dense_top_k   = dense_top_k
+        self.keyword_top_k = keyword_top_k
+        self.rerank_top_n  = rerank_top_n
         self.enable_keyword = enable_keyword
-        self.embedder  = Embedder()
-        self.reranker  = Reranker(device=reranker_device)
-        self.client    = QdrantClient(url=qdrant_url)
+        self.embedder      = Embedder()
+        self.client        = QdrantClient(url=qdrant_url)
         self.keyword_store = KeywordStore() if enable_keyword else None
 
     # ---------------------------------------------------------------------- #
@@ -152,55 +92,64 @@ class Retriever:
             for h in results.points
         ]
 
-    # ---------------------------------------------------------------------- #
-
     def _keyword_search(self, query: str) -> list[dict]:
         """Return keyword search candidates from FTS5."""
         if not self.keyword_store or not self.keyword_store.exists():
             return []
         results = self.keyword_store.search(query, top_k=self.keyword_top_k)
-        # Add qdrant_score=0 so downstream code has a uniform schema
         for r in results:
-            r["qdrant_score"] = 0.0
+            r.setdefault("qdrant_score", 0.0)
         return results
 
-    @staticmethod
-    def _merge_candidates(dense: list[dict], keyword: list[dict],
-                          max_total: int) -> list[dict]:
-        """Merge dense + keyword candidates, deduplicate by (url, chunk_index).
+    def _rrf_fuse(self, dense: list[dict], keyword: list[dict],
+                  top_n: int) -> list[dict]:
+        """Reciprocal Rank Fusion across dense and keyword ranked lists.
 
-        Dense candidates are kept first (higher quality), then keyword-only
-        candidates fill remaining slots up to max_total.
+        score(d) = Σ_i  1 / (RRF_K + rank_i(d))
+        Docs absent from a retriever contribute 0 from that retriever.
         """
-        seen = set()
-        merged = []
+        scores: dict[tuple, float] = {}
+        lookup: dict[tuple, dict] = {}
+        dense_keys: set[tuple] = set()
+        keyword_keys: set[tuple] = set()
 
-        # Dense candidates first (they have qdrant_score)
-        for c in dense:
-            key = (c["url"], c["chunk_index"])
-            if key not in seen:
-                seen.add(key)
-                c["retrieval_source"] = "dense"
-                merged.append(c)
+        for rank, doc in enumerate(dense, start=1):
+            key = (doc["url"], doc["chunk_index"])
+            dense_keys.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            lookup[key] = doc
 
-        # Add keyword-only candidates (not already in dense results)
-        for c in keyword:
-            key = (c["url"], c["chunk_index"])
-            if key not in seen:
-                seen.add(key)
-                c["retrieval_source"] = "keyword"
-                merged.append(c)
+        for rank, doc in enumerate(keyword, start=1):
+            key = (doc["url"], doc["chunk_index"])
+            keyword_keys.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            lookup.setdefault(key, doc)
 
-        return merged[:max_total]
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+        results = []
+        for key, score in ranked:
+            item = dict(lookup[key])
+            item["rerank_score"] = round(score, 6)
+            in_dense   = key in dense_keys
+            in_keyword = key in keyword_keys
+            item["retrieval_source"] = (
+                "hybrid"  if (in_dense and in_keyword) else
+                "dense"   if in_dense else
+                "keyword"
+            )
+            results.append(item)
+
+        return results
 
     def retrieve(self, query: str,
                  top_n: int | None = None) -> list[dict]:
         """
-        Full pipeline: embed → dense search (+ keyword search) → merge → rerank.
+        Full pipeline: embed → dense search (+ keyword search) → RRF fusion.
 
-        Returns list of dicts (sorted by rerank score):
-            {text, url, title, category, source_type, chunk_index,
-             qdrant_score, rerank_score, retrieval_source}
+        Returns list of dicts sorted by RRF score:
+            {text, text_clean, url, title, category, source_type,
+             chunk_index, chunk_type, qdrant_score, rerank_score, retrieval_source}
         """
         top_n = top_n or self.rerank_top_n
 
@@ -208,37 +157,30 @@ class Retriever:
         emb = self.embedder.embed_query(query)
         query_vec = emb["dense"]
 
-        # 2a. Dense search
-        dense_candidates = self._dense_search(query_vec)
+        # 2a. Dense search — filter navigation chunks (near-empty, no answer content)
+        dense_candidates = [
+            c for c in self._dense_search(query_vec)
+            if c.get("chunk_type") != "navigation"
+        ]
 
         # 2b. Keyword search (FTS5)
         keyword_candidates = self._keyword_search(query) if self.enable_keyword else []
 
-        n_dense = len(dense_candidates)
+        n_dense   = len(dense_candidates)
         n_keyword = len(keyword_candidates)
 
-        # 3. Merge & deduplicate
-        candidates = self._merge_candidates(
-            dense_candidates, keyword_candidates, self.max_candidates)
-
-        if not candidates:
+        if not dense_candidates and not keyword_candidates:
             return []
 
-        n_merged = len(candidates)
-        n_keyword_only = sum(1 for c in candidates if c.get("retrieval_source") == "keyword")
+        # 3. RRF fusion
+        results = self._rrf_fuse(dense_candidates, keyword_candidates, top_n=top_n)
+
+        n_hybrid  = sum(1 for r in results if r["retrieval_source"] == "hybrid")
+        n_kw_only = sum(1 for r in results if r["retrieval_source"] == "keyword")
         if n_keyword > 0:
-            print(f"  Hybrid retrieval: {n_dense} dense + {n_keyword} keyword → {n_merged} unique ({n_keyword_only} keyword-only)")
-
-        # 4. Rerank candidates (use text_clean to avoid URL noise)
-        passages = [c.get("text_clean", c["text"]) for c in candidates]
-        ranked   = self.reranker.rerank(query, passages, top_n=top_n)
-
-        # 5. Build final results
-        results = []
-        for orig_idx, score in ranked:
-            item = dict(candidates[orig_idx])
-            item["rerank_score"] = round(score, 4)
-            results.append(item)
+            print(f"  Hybrid retrieval: {n_dense} dense + {n_keyword} keyword → "
+                  f"top-{len(results)} via RRF "
+                  f"({n_hybrid} hybrid, {n_kw_only} keyword-only)")
 
         return results
 
@@ -250,23 +192,19 @@ def main() -> None:
     parser.add_argument("--query", required=True, help="Query string")
     parser.add_argument("--top-n", type=int, default=RERANK_TOP_N,
                         help=f"Number of results (default {RERANK_TOP_N})")
-    parser.add_argument("--reranker-device", default=RERANKER_DEVICE,
-                        choices=["auto", "cpu", "xpu", "cuda"],
-                        help="Reranker device: auto / cpu / xpu(Intel) / cuda(NVIDIA)")
     parser.add_argument("--no-keyword", action="store_true",
                         help="Disable keyword search (dense only)")
     args = parser.parse_args()
 
-    ret = Retriever(reranker_device=args.reranker_device,
-                    enable_keyword=not args.no_keyword)
+    ret = Retriever(enable_keyword=not args.no_keyword)
     results = ret.retrieve(args.query, top_n=args.top_n)
 
     print(f"\n=== Query: {args.query!r} ===")
-    print(f"Top {len(results)} results after reranking:\n")
+    print(f"Top {len(results)} results via RRF:\n")
 
     for i, r in enumerate(results):
         src = r.get("retrieval_source", "dense")
-        print(f"[{i+1}] rerank={r['rerank_score']:.4f}  qdrant={r['qdrant_score']:.4f}  src={src}")
+        print(f"[{i+1}] rrf={r['rerank_score']:.6f}  qdrant={r['qdrant_score']:.4f}  src={src}")
         print(f"     URL  : {r['url']}")
         print(f"     type : {r['source_type']}  chunk: {r['chunk_index']}")
         print(f"     text : {r['text'][:200].replace(chr(10), ' ')}…")
