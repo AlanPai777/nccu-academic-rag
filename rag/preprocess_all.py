@@ -35,6 +35,11 @@ def main():
     out_path = ROOT / "output" / "extracted_texts.jsonl"
 
     records = json.loads(map_path.read_text(encoding="utf-8"))
+    supplementary_map = ROOT / "output" / "supplementary_map.json"
+    if supplementary_map.exists():
+        extra = json.loads(supplementary_map.read_text(encoding="utf-8"))
+        records += extra
+        print(f"  + supplementary_map.json: {len(extra)} records merged")
     if args.test:
         records = records[:20]
         print(f"[TEST MODE] Processing first {len(records)} records only.\n")
