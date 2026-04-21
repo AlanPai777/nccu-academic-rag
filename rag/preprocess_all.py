@@ -74,7 +74,7 @@ def main():
 
             entry = {
                 "url":         rec.get("url", ""),
-                "title":       rec.get("url", "").split("/")[-1] or rec.get("url", ""),
+                "title":       rec.get("form_title") or rec.get("url", "").split("/")[-1] or rec.get("url", ""),
                 "source_type": source_type,
                 "category":    rec.get("category", ""),
                 "depth":       rec.get("depth"),

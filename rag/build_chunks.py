@@ -24,7 +24,7 @@ def build_metadata(rec: dict) -> dict:
     """Extract metadata fields from a map.json record."""
     return {
         "url":         rec.get("url", ""),
-        "title":       rec.get("url", "").split("/")[-1] or rec.get("url", ""),
+        "title":       rec.get("form_title") or rec.get("url", "").split("/")[-1] or rec.get("url", ""),
         "depth":       rec.get("depth", 0),
         "source_type": rec.get("type", "html"),
         "category":    rec.get("category", ""),
