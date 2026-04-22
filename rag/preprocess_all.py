@@ -27,19 +27,27 @@ def main():
                         help="Process only the first 20 records (quick test)")
     args = parser.parse_args()
 
-    map_path = ROOT / "output" / "map.json"
-    if not map_path.exists():
-        print(f"ERROR: {map_path} not found. Run the crawler first.")
+    output_dir = ROOT / "output"
+    out_path = output_dir / "extracted_texts.jsonl"
+
+    # Collect records from all output/<subdomain>/map.json and supplementary_map.json
+    records: list[dict] = []
+    subdirs = sorted(d for d in output_dir.iterdir() if d.is_dir())
+    if not subdirs:
+        print(f"ERROR: No subdomain directories found in {output_dir}. Run the crawler first.")
         sys.exit(1)
 
-    out_path = ROOT / "output" / "extracted_texts.jsonl"
-
-    records = json.loads(map_path.read_text(encoding="utf-8"))
-    supplementary_map = ROOT / "output" / "supplementary_map.json"
-    if supplementary_map.exists():
-        extra = json.loads(supplementary_map.read_text(encoding="utf-8"))
-        records += extra
-        print(f"  + supplementary_map.json: {len(extra)} records merged")
+    for subdir in subdirs:
+        sub_map = subdir / "map.json"
+        sub_supp = subdir / "supplementary_map.json"
+        if sub_map.exists():
+            extra = json.loads(sub_map.read_text(encoding="utf-8"))
+            records += extra
+            print(f"  + {subdir.name}/map.json: {len(extra)} records")
+        if sub_supp.exists():
+            extra = json.loads(sub_supp.read_text(encoding="utf-8"))
+            records += extra
+            print(f"  + {subdir.name}/supplementary_map.json: {len(extra)} records")
     if args.test:
         records = records[:20]
         print(f"[TEST MODE] Processing first {len(records)} records only.\n")

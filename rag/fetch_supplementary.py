@@ -3,13 +3,14 @@ fetch_supplementary.py — Download direct-URL files from supplementary sources.
 
 Handles sources where files are directly accessible (no token/auth mechanism).
 Each source is a named URL list. Records are upserted into
-output/supplementary_map.json via supplementary_map.update().
+output/<subdomain>/supplementary_map.json via supplementary_map.update().
 
 To add a new office source: add an entry to SOURCES below.
 
 Usage:
-    python rag/fetch_supplementary.py           # download all sources
-    python rag/fetch_supplementary.py --dry-run # plan without downloading
+    python rag/fetch_supplementary.py                      # download all (default: aca)
+    python rag/fetch_supplementary.py --subdomain osa      # for osa-discovered links
+    python rag/fetch_supplementary.py --dry-run            # plan without downloading
 """
 
 from __future__ import annotations
@@ -27,8 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 import rag.supplementary_map as smap
 
-OUTPUT_DIR = ROOT / "output" / "docs" / "admin_academic"
-DELAY      = 0.5
+DELAY = 0.5
 
 # Each source: (label, category, list of direct URLs)
 # DOCX/XLSX are downloaded for future use; build_chunks.py currently indexes PDF only.
@@ -44,8 +44,8 @@ SOURCES: list[tuple[str, str, list[str]]] = [
         ],
     ),
     # Future sources — add here when subdomains are crawled:
-    # ("osa.nccu.edu.tw", "admin_student", [...]),
-    # ("ga.nccu.edu.tw",  "admin_general", [...]),
+    # ("osa.nccu.edu.tw forms", "admin_student", [...]),
+    # ("nccuga.nccu.edu.tw forms", "admin_general", [...]),
 ]
 
 
@@ -53,9 +53,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Download supplementary direct-URL files.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan downloads without fetching")
+    parser.add_argument("--subdomain", default="aca",
+                        help="Subdomain directory to write into (default: aca)")
     args = parser.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = ROOT / "output" / args.subdomain / "docs" / "admin_academic"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict] = []
     skipped = 0
@@ -70,7 +73,7 @@ def main() -> None:
 
             for url in urls:
                 filename = url.split("/")[-1]
-                dest = OUTPUT_DIR / f"newdoc_{filename}"
+                dest = output_dir / f"newdoc_{filename}"
                 print(f"  {filename}", flush=True)
 
                 if args.dry_run:
@@ -104,11 +107,11 @@ def main() -> None:
                 })
 
     if not args.dry_run:
-        total = smap.update(records)
+        total = smap.update(records, subdomain=args.subdomain)
         print(f"\n{'='*50}")
         print(f"Downloaded : {len(records)}")
         print(f"Skipped    : {skipped}")
-        print(f"Map total  : {total} records in {smap.MAP_OUT}")
+        print(f"Map total  : {total} records in {smap.get_path(args.subdomain)}")
     else:
         print(f"\n{'='*50}")
         print(f"Would download : {sum(len(u) for _, _, u in SOURCES)}")

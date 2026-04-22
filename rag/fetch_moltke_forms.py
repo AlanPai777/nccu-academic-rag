@@ -143,12 +143,15 @@ def download_pdf(client: httpx.Client, token: str, dest: Path) -> int | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch moltke form PDFs into output/.")
+    parser = argparse.ArgumentParser(description="Fetch moltke form PDFs into output/<subdomain>/.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse pages but skip file downloads")
+    parser.add_argument("--subdomain", default="aca",
+                        help="Subdomain directory to write into (default: aca)")
     args = parser.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = ROOT / "output" / args.subdomain / "docs" / "admin_academic"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict] = []
     skipped = 0
@@ -180,7 +183,7 @@ def main() -> None:
             token, link_text = result
             print(f"  PDF   : {link_text}")
 
-            dest = OUTPUT_DIR / f"moltke_{form_id.replace('/', '_')}.pdf"
+            dest = output_dir / f"moltke_{form_id.replace('/', '_')}.pdf"
             canonical = f"{BASE_URL}/link.jsp?viewdetail={form_id}"
 
             if args.dry_run:
@@ -215,11 +218,11 @@ def main() -> None:
             })
 
     if not args.dry_run:
-        total = smap.update(records)
+        total = smap.update(records, subdomain=args.subdomain)
         print(f"\n{'='*50}")
         print(f"Downloaded : {len(records)}")
         print(f"Skipped    : {skipped}")
-        print(f"Map total  : {total} records in {smap.MAP_OUT}")
+        print(f"Map total  : {total} records in {smap.get_path(args.subdomain)}")
     else:
         print(f"\n{'='*50}")
         print(f"Downloaded : {len(records)}")
