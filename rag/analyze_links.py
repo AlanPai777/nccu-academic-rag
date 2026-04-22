@@ -23,8 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
-ROOT  = Path(__file__).parent.parent
-INPUT = ROOT / "output" / "extracted_texts.jsonl"
+ROOT = Path(__file__).parent.parent
 
 # Known supplementary systems — flagged so you know how to handle them
 KNOWN_SYSTEMS: dict[str, str] = {
@@ -61,21 +60,26 @@ def main() -> None:
                              "(default: 2)")
     args = parser.parse_args()
 
-    if not INPUT.exists():
-        print(f"ERROR: {INPUT} not found. Run preprocess_all.py first.")
+    output_dir = ROOT / "output"
+    if args.subdomain:
+        input_files = [output_dir / args.subdomain / "extracted_texts.jsonl"]
+    else:
+        input_files = sorted(output_dir.glob("*/extracted_texts.jsonl"))
+
+    if not input_files or not any(p.exists() for p in input_files):
+        print(f"ERROR: No extracted_texts.jsonl found. Run preprocess_all.py first.")
         sys.exit(1)
 
-    # Load records, optionally filtered by subdomain
     records: list[dict] = []
-    with open(INPUT, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            if args.subdomain and args.subdomain not in r.get("url", ""):
-                continue
-            records.append(r)
+    for path in input_files:
+        if not path.exists():
+            print(f"  WARNING: {path} not found, skipping.")
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
 
     label = f"subdomain={args.subdomain}" if args.subdomain else "all subdomains"
     print(f"Records analyzed : {len(records)} ({label})")
