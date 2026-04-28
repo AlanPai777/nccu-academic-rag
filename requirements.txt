@@ -5,12 +5,11 @@ lxml
 
 # Document parsing
 pdfplumber
-python-docx
-openpyxl
 
-# RAG: Reranking (Jina Reranker v2 via sentence-transformers)
-sentence-transformers
-einops
+# RAG: LlamaIndex (retriever layer — dense + keyword + RRF fusion)
+llama-index-core
+llama-index-embeddings-ollama
+llama-index-vector-stores-qdrant
 
 # RAG: Vector database
 qdrant-client
@@ -18,15 +17,13 @@ qdrant-client
 # RAG: Keyword search (FTS5 Chinese segmentation)
 jieba
 
-# RAG: Utilities
-langdetect
+# RAG: Token counting (PDF chunker)
 tiktoken
 
 # Web UI
 gradio
 
-# Note: PyTorch (required by FlagEmbedding) is NOT listed here.
-# Install it separately based on your hardware:
+# Note: PyTorch is NOT listed here — install separately based on your hardware:
 #
 # CPU only:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -35,5 +32,10 @@ gradio
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 #
 # Intel GPU (Arc / Core Ultra iGPU):
-#   Use ipex-llm Ollama for embedding and LLM inference.
+#   Use ipex-llm Ollama for LLM inference + standalone Ollama for embedding.
 #   See: https://github.com/intel/ipex-llm
+#
+# Removed:
+#   sentence-transformers / einops — Jina reranker replaced by RRF fusion (Phase 5.5)
+#   python-docx / openpyxl — RAG pipeline handles HTML and PDF only
+#   langdetect — not used in current pipeline

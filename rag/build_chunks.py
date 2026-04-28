@@ -76,7 +76,16 @@ def process_record(rec: dict, base: Path) -> list[dict]:
     elif actual_type == "pdf":
         text = extract_pdf(fpath)
         if not text:
-            return []
+            # Stub chunk: preserve URL so the document is discoverable via keyword/dense search.
+            # chunk_type="navigation" keeps it out of dense candidates (_NavigationFilter)
+            # but it remains in FTS5. On re-run after OCR, real chunks replace this stub.
+            stub_text = meta.get("title") or fpath.name
+            stub = {**meta,
+                    "text":       stub_text,
+                    "text_clean": stub_text,
+                    "chunk_len":  len(stub_text),
+                    "chunk_type": "navigation"}
+            return [stub]
         chunks = chunk_pdf(text, meta)
         for chunk in chunks:
             chunk["chunk_type"] = "content"
@@ -134,6 +143,7 @@ def main():
     skip_failed = 0
     skip_office = 0
     skip_empty  = 0
+    stub_count  = 0
     html_count = 0
     pdf_count = 0
 
@@ -155,10 +165,14 @@ def main():
                 continue
 
             ftype = rec.get("type", "")
+            chunk_types = {c.get("chunk_type") for c in chunks}
             if ftype == "html":
                 html_count += 1
             elif ftype == "document":
-                pdf_count += 1
+                if chunk_types == {"navigation"} and len(chunks) == 1 and len(chunks[0]["text"]) < 200:
+                    stub_count += 1
+                else:
+                    pdf_count += 1
 
             for chunk in chunks:
                 f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
@@ -172,6 +186,7 @@ def main():
     print(f"Records processed : {len(records) - skipped}")
     print(f"  HTML files       : {html_count}")
     print(f"  PDF  files       : {pdf_count}")
+    print(f"  PDF stubs        : {stub_count}  (URL-only, pending OCR)")
     print(f"Records skipped   : {skipped}")
     print(f"  fetch failed     : {skip_failed}")
     print(f"  office/other fmt : {skip_office}  (.doc/.odt/.pptx etc.)")
