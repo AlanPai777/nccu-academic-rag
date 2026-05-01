@@ -23,6 +23,11 @@ tiktoken
 # Web UI
 gradio
 
+# Agentic RAG (Prototype 1+)
+ollama
+openai>=1.0
+python-dotenv>=1.0
+
 # Note: PyTorch is NOT listed here — install separately based on your hardware:
 #
 # CPU only:

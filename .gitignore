@@ -4,6 +4,8 @@ output/
 # Generated RAG data (regeneratable from output/)
 rag/chunks.jsonl
 rag/cache.db
+rag/cache.db.bak
+*.db.bak
 rag/fts.db
 
 # Python
