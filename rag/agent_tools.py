@@ -17,21 +17,39 @@ CRAWLER_OUTPUT = "/home/alanpai/NCCU-CS-Project/NCCU-Crawler/output"
 NCCU_LINK_RE   = re.compile(r'\[([^\]]+)\]\((https?://[^)]*\.nccu\.edu\.tw[^)]*)\)')
 FORM_ID_RE     = re.compile(r'QP-[A-Z0-9]+-[A-Z0-9]+-[A-Z0-9]+')
 
+# Group names for multi-subdomain search (grep_texts group= parameter).
+SUBDOMAIN_GROUPS: dict[str, list[str]] = {
+    "nccuga": ["nccuga", "cashier", "dean", "docu", "aff",
+               "police", "wealth", "mend", "environ", "cpds"],
+    "osa":    ["osa"],
+    "aca":    ["aca"],
+    "oic":    ["oic"],
+    "lib":    ["www.lib"],
+    "www":    ["www"],
+    "learning": ["learning"],
+}
+
 
 # ── Tool 1: grep_texts ────────────────────────────────────────────────────────
 
 def grep_texts(
     pattern: str,
     subdomain: str | None = None,
+    group: str | None = None,
     max_results: int = 5
 ) -> list[dict]:
     """
     Full-text search across extracted_texts.jsonl files.
-    subdomain restricts scope: aca / osa / www.lib / learning / nccuga / oic
+    subdomain: restrict to one subdomain (e.g. "aca", "cashier")
+    group: restrict to a named group defined in SUBDOMAIN_GROUPS
+           (e.g. "nccuga" searches all 10 general-affairs subdomains)
     Returns [{url, title, preview, subdomain}, ...]
     """
     if subdomain:
         paths = [f"{CRAWLER_OUTPUT}/{subdomain}/extracted_texts.jsonl"]
+    elif group:
+        subdomains = SUBDOMAIN_GROUPS.get(group, [])
+        paths = [f"{CRAWLER_OUTPUT}/{s}/extracted_texts.jsonl" for s in subdomains]
     else:
         paths = glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_texts.jsonl")
 

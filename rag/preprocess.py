@@ -63,6 +63,34 @@ def _node_to_text(node, base_url: str) -> str:
     return content
 
 
+def _decode_cf_email(encoded: str) -> str:
+    """
+    Decode a Cloudflare email protection token (data-cfemail attribute).
+    The encoding is a simple XOR cipher: first byte is the key,
+    remaining bytes are XOR'd with it to recover the original email.
+    """
+    try:
+        r = int(encoded[:2], 16)
+        return "".join(
+            chr(int(encoded[i:i + 2], 16) ^ r)
+            for i in range(2, len(encoded), 2)
+        )
+    except Exception:
+        return ""
+
+
+def _decode_cf_emails_in_soup(soup: BeautifulSoup) -> None:
+    """
+    In-place: replace all Cloudflare-obfuscated email spans with plain text.
+    Joomla uses <span class="__cf_email__" data-cfemail="..."> to hide emails
+    from crawlers. The obfuscation is client-side JS; we decode it server-side.
+    """
+    for span in soup.find_all(attrs={"data-cfemail": True}):
+        email = _decode_cf_email(span["data-cfemail"])
+        if email:
+            span.replace_with(email)
+
+
 def extract_html(path: str | Path, url: str = "") -> str:
     """
     Extract main content text from a downloaded HTML file.
@@ -71,6 +99,7 @@ def extract_html(path: str | Path, url: str = "") -> str:
     Falls back to <main>, then <body> if div.item-page is absent.
     Removes nav, footer, header, script, style, aside tags before extraction.
     Preserves hyperlinks as markdown [text](url).
+    Decodes Cloudflare email protection (data-cfemail) before extraction.
 
     Returns plain text with normalised whitespace.
     """
@@ -83,6 +112,9 @@ def extract_html(path: str | Path, url: str = "") -> str:
         soup = BeautifulSoup(raw, "lxml")
     except Exception:
         return ""
+
+    # Decode Cloudflare-obfuscated emails before any other processing
+    _decode_cf_emails_in_soup(soup)
 
     # Extract page title as fallback for empty/placeholder pages
     # If no <title> tag, derive from URL filename
@@ -264,11 +296,63 @@ def extract_pdf(path: str | Path) -> str:
 if __name__ == "__main__":
     import sys
     import json
+    import tempfile
     from pathlib import Path
 
     base = Path(__file__).parent.parent
 
-    # Quick test: show extraction results for a few files
+    # ── CF email decode unit test (no output/ needed) ──────────────────────────
+    print("=== CF email decode test ===")
+
+    def _cf_encode(email: str, key: int = 0x55) -> str:
+        """Helper: encode an email with CF XOR cipher for test HTML generation."""
+        result = format(key, "02x")
+        for c in email:
+            result += format(ord(c) ^ key, "02x")
+        return result
+
+    test_cases = [
+        "karena@nccu.edu.tw",
+        "nccudorm@nccu.edu.tw",
+        "oic@nccu.edu.tw",
+    ]
+
+    # Build a test HTML with Joomla-style CF-obfuscated emails
+    rows = ""
+    for email in test_cases:
+        encoded = _cf_encode(email)
+        rows += (
+            f'<tr><td>e-mail</td>'
+            f'<td><a href="/cdn-cgi/l/email-protection#ignored">'
+            f'<span class="__cf_email__" data-cfemail="{encoded}">'
+            f'[email&#160;protected]</span></a></td></tr>\n'
+        )
+
+    test_html = f"""<!DOCTYPE html>
+<html><head><title>CF Email Test</title></head>
+<body><div class="item-page">
+<table>{rows}</table>
+</div></body></html>"""
+
+    with tempfile.NamedTemporaryFile(suffix=".html", mode="w",
+                                     encoding="utf-8", delete=False) as f:
+        f.write(test_html)
+        tmp_path = f.name
+
+    result = extract_html(tmp_path, "https://test.nccu.edu.tw/")
+    Path(tmp_path).unlink()
+
+    passed = all(email in result for email in test_cases)
+    for email in test_cases:
+        status = "✓" if email in result else "✗"
+        print(f"  {status} {email}")
+    print(f"  Result: {'PASS' if passed else 'FAIL'}\n")
+
+    if not passed:
+        print("Extracted text:\n", result)
+        sys.exit(1)
+
+    # ── Quick test: show extraction results for a few files ────────────────────
     map_path = base / "output" / "map.json"
     if not map_path.exists():
         print("map.json not found")

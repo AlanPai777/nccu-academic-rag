@@ -1,7 +1,7 @@
 """
 rag/eval.py
 Auto-scoring framework for eval_baseline_01_休學_zh.md.
-8 criteria × 2 points = 16 max.
+9 criteria × 2 points = 18 max.
 """
 
 EVAL_CRITERIA = [
@@ -43,8 +43,14 @@ EVAL_CRITERIA = [
     },
     {
         "name":        "form_links",
-        "description": "QP-T01-03-02 連結存在",
+        "description": "QP-T01-03-02 休學申請書連結存在（必要）",
         "keywords":    ["QP-T01-03-02"],
+        "min_hits":    1,
+    },
+    {
+        "name":        "supplementary_forms",
+        "description": "補充表單：QP-T01-02-05 委託書 或 QP-T01-03-04 提早復學（完整度加分）",
+        "keywords":    ["QP-T01-02-05", "QP-T01-03-04"],
         "min_hits":    1,
     },
     {
@@ -71,7 +77,7 @@ def score_answer(answer: str) -> dict:
     return {
         "scores":  scores,
         "total":   total,
-        "max":     16,
+        "max":     18,
         "missing": [k for k, v in scores.items() if v < 2],
     }
 
