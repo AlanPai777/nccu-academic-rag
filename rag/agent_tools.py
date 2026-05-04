@@ -13,7 +13,7 @@ import subprocess
 import urllib.parse
 from pathlib import Path
 
-CRAWLER_OUTPUT = "/home/alanpai/NCCU-CS-Project/NCCU-Crawler/output"
+CRAWLER_OUTPUT = str(Path(__file__).parent.parent / "output")
 NCCU_LINK_RE   = re.compile(r'\[([^\]]+)\]\((https?://[^)]*\.nccu\.edu\.tw[^)]*)\)')
 FORM_ID_RE     = re.compile(r'QP-[A-Z0-9]+-[A-Z0-9]+-[A-Z0-9]+')
 

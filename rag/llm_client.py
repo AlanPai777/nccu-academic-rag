@@ -44,10 +44,17 @@ def chat_with_tools(
     messages: list[dict],
     tools: list[dict],
     system_prompt: str | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,
 ) -> tuple[str | None, list | None]:
     """
     Chat with tool definitions. Provider-agnostic.
+
+    max_tokens:
+        None（預設）= 不限制輸出長度，讓模型遇到 EOS token 自行停止。
+            - Ollama：num_predict=-1
+            - OpenRouter：省略 max_tokens 欄位（傳 -1 會 API error）
+        int = 硬性截斷上限；適合快速測試或避免計費超支。
+        注意：max_tokens 只限制「輸出」token 數，不影響模型能看到的 context 長度。
 
     Returns:
         (content, tool_calls)
@@ -68,8 +75,13 @@ def chat_with_tools(
     return _ollama_chat(full_messages, tools, max_tokens)
 
 
-def simple_chat(messages: list[dict], max_tokens: int = 200) -> str:
-    """Chat without tools; returns answer string."""
+def simple_chat(messages: list[dict], max_tokens: int | None = None) -> str:
+    """
+    Chat without tools; returns answer string.
+
+    max_tokens=None（預設）= 不限制輸出長度，適合完整答案評估。
+    傳入 int 可限制輸出，適合快速冒煙測試（如 __main__ 的自我介紹測試）。
+    """
     content, _ = chat_with_tools(messages, tools=[], max_tokens=max_tokens)
     return content or ""
 
@@ -104,7 +116,7 @@ def _to_ollama_messages(messages: list[dict]) -> list[dict]:
 def _ollama_chat(
     messages: list[dict],
     tools: list[dict],
-    max_tokens: int,
+    max_tokens: int | None,
 ) -> tuple[str | None, list | None]:
     from ollama import Client
 
@@ -112,11 +124,16 @@ def _ollama_chat(
         host=OLLAMA_HOST,
         headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
     )
+    # Ollama 用 num_predict 控制輸出長度。
+    # 本地 Ollama：-1 = 無限制（模型遇到 EOS 自行停止）
+    # Ollama cloud API：不接受 -1，必須傳正整數（回傳 400 error）
+    # → None 時改用 8192，實際上對所有查詢已足夠（休學答案約 1000–2000 tokens）
+    num_predict = 8192 if max_tokens is None else max_tokens
     response = client.chat(
         model=OLLAMA_MODEL,
         messages=_to_ollama_messages(messages),
         tools=tools if tools else None,
-        options={"num_predict": max_tokens},
+        options={"num_predict": num_predict},
     )
     msg = response.message
     content = msg.content or None
@@ -143,7 +160,7 @@ def _ollama_chat(
 def _openrouter_chat(
     messages: list[dict],
     tools: list[dict],
-    max_tokens: int,
+    max_tokens: int | None,
 ) -> tuple[str | None, list | None]:
     from openai import OpenAI
 
@@ -151,9 +168,12 @@ def _openrouter_chat(
     kwargs: dict = {
         "model":       OPENROUTER_MODEL,
         "messages":    messages,
-        "max_tokens":  max_tokens,
         "temperature": 0,
     }
+    # OpenRouter 不接受 max_tokens=-1（會回傳 API error）。
+    # 省略這個欄位才是「不限制」；有值時才加入 kwargs。
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"

@@ -238,13 +238,148 @@ def _ocr_pdf(path: Path) -> str:
     return text.strip()
 
 
+def _table_to_markdown(table: list[list]) -> str:
+    """
+    Convert a pdfplumber table (list of rows) to a Markdown table string.
+
+    Why Markdown instead of flattened text?
+    pdfplumber's extract_text() linearises multi-column tables into a single
+    stream of characters ordered by x/y position.  For forms like moltke
+    QP-T01-03-02 the three side-by-side approval columns
+    (教務處承辦人 | 組長批示 | 教務長) get interleaved into an unreadable
+    sequence — the LLM cannot tell that these are three independent fields.
+    Markdown pipes make column boundaries explicit so the model reliably
+    identifies parallel slots.
+
+    Empty-column pruning: PDF merged cells leave ghost columns whose every
+    cell is empty after whitespace stripping.  Keeping them adds noise and
+    widens the table without adding information, so they are dropped.
+    """
+    if not table:
+        return ""
+
+    # Normalise cells: None → "", strip whitespace and internal newlines
+    rows = [
+        [str(c).replace("\n", " ").strip() if c else "" for c in row]
+        for row in table
+    ]
+
+    # Drop columns that are empty in every row (merged-cell artefacts)
+    col_count = max(len(r) for r in rows)
+    non_empty_cols = [
+        i for i in range(col_count)
+        if any(i < len(r) and r[i] for r in rows)
+    ]
+    rows = [[r[i] for i in non_empty_cols if i < len(r)] for r in rows]
+
+    if not rows or not rows[0]:
+        return ""
+
+    md_rows = ["| " + " | ".join(row) + " |" for row in rows]
+    separator = "| " + " | ".join(["---"] * len(rows[0])) + " |"
+    md_rows.insert(1, separator)
+    return "\n".join(md_rows)
+
+
+def _extract_pdf_pdfplumber(path: Path) -> str:
+    """
+    Extract text from a PDF using pdfplumber with smart table handling.
+
+    Per-page strategy
+    -----------------
+    Pages WITHOUT tables:
+        extract_text() — plain linearised text, same as before.
+
+    Pages WITH tables (detected via PDF line/rectangle primitives):
+        Two-step approach to avoid duplication:
+
+        Step 1 — outside text:
+            page.filter(_outside_tables).extract_text()
+            Keeps only characters whose bounding box falls OUTSIDE every
+            table's bbox.  This captures headers, titles, footnotes and
+            any prose that sits beside the table — content that
+            extract_tables() would silently drop.
+
+        Step 2 — Markdown tables:
+            find_tables() → each Table.extract() → _table_to_markdown()
+            Preserves column structure so the LLM sees parallel cells on
+            the same line rather than an interleaved character stream.
+
+        Result: outside_text + Markdown tables, zero duplication.
+
+    Why not just extract_text() + extract_tables()?
+        extract_text() already includes linearised table cell content.
+        Appending Markdown tables on top duplicates every cell — once as
+        garbled linear text, once as clean Markdown.  For QP-T01-03-02
+        this inflated output from 1,998 chars to 3,382 chars with no
+        quality gain.
+
+    Applicability to other PDFs:
+        find_tables() relies on PDF line/rectangle primitives (explicit
+        borders).  Borderless tables (whitespace-aligned columns) are not
+        detected and fall through to extract_text() — safe, no data loss.
+        Image-only or CID-encoded PDFs produce empty output here and are
+        handled by the _ocr_pdf() fallback in extract_pdf().
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return ""
+
+    def _outside_tables(char, bboxes):
+        # pdfplumber char dicts carry x0/top/x1/bottom in PDF points.
+        # ±1 pt tolerance prevents floating-point edge cases where a
+        # character sitting exactly on a table border gets misclassified.
+        for bbox in bboxes:
+            if (char["x0"] >= bbox[0] - 1 and char["top"] >= bbox[1] - 1 and
+                    char["x1"] <= bbox[2] + 1 and char["bottom"] <= bbox[3] + 1):
+                return False  # inside this table — exclude
+        return True           # outside all tables — keep
+
+    try:
+        with pdfplumber.open(path) as pdf:
+            pages = []
+            for page in pdf.pages:
+                table_objects = page.find_tables()
+                if table_objects:
+                    bboxes = [t.bbox for t in table_objects]
+
+                    # Step 1: text outside all tables (headers, footnotes, etc.)
+                    outside = (
+                        page.filter(lambda c: _outside_tables(c, bboxes))
+                        .extract_text() or ""
+                    ).strip()
+
+                    # Step 2: each table as a Markdown block
+                    parts = [_table_to_markdown(t.extract()) for t in table_objects]
+                    md = "\n\n".join(p for p in parts if p)
+
+                    if md:
+                        combined = (outside + "\n\n" + md).strip() if outside else md
+                        pages.append(combined)
+                    elif outside:
+                        # table borders detected but all cells empty — keep prose only
+                        pages.append(outside)
+                else:
+                    # No tables: plain text (regulations, announcements, etc.)
+                    plain = (page.extract_text() or "").strip()
+                    if plain:
+                        pages.append(plain)
+    except Exception:
+        return ""
+
+    return "\n\n".join(pages)
+
+
 def extract_pdf(path: str | Path) -> str:
     """
     Extract text from a PDF file.
 
     Cascade:
-    1. pdfplumber — fast, text-based PDFs (files under 50 MB)
-       PyMuPDF (_extract_pdf_fitz) — large PDFs (≥50 MB); same accuracy, far lower RAM
+    1. pdfplumber mixed mode (_extract_pdf_pdfplumber) — text-based PDFs under 50 MB.
+       Pages with tables → Markdown (preserves column structure for LLMs).
+       Pages without tables → plain text (original behaviour).
+       PyMuPDF (_extract_pdf_fitz) — large PDFs (≥50 MB); lower RAM overhead.
     2. OCR fallback (_ocr_pdf) — if result is image-only (<100 chars) or
        cid:XX undecodable (>20% of chars are cid codes). Requires pytesseract
        + tesseract-ocr chi_tra. Returns empty string if not installed.
@@ -263,21 +398,10 @@ def extract_pdf(path: str | Path) -> str:
             return _ocr_pdf(path)
         return text
 
-    try:
-        import pdfplumber
-    except ImportError:
-        return ""
+    text = _extract_pdf_pdfplumber(path)
 
-    try:
-        with pdfplumber.open(path) as pdf:
-            pages = []
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    pages.append(t.strip())
-            text = "\n\n".join(pages)
-    except Exception:
-        return _ocr_pdf(path)  # PDF open error — try OCR directly
+    if not text:
+        return _ocr_pdf(path)  # PDF open error or empty — try OCR directly
 
     if len(text) < 100:
         # Image-only PDF (no text layer) — fall back to OCR

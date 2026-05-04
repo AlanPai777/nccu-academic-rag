@@ -4,22 +4,37 @@ Prototype 1: Agentic RAG with 5 tools.
 Uses llm_client.chat_with_tools() — works with both Ollama cloud and OpenRouter.
 
 Run:
-    # Ollama cloud (default)
-    python rag/proto1_direct.py "如何辦理休學"
+    # Ollama cloud (default, Mode 3 full agentic)
+    python -m rag.proto1_direct "如何辦理休學"
+
+    # Mode 1: pure parametric (no tools, no RAG — baseline knowledge test)
+    python -m rag.proto1_direct "如何辦理休學" --mode 1
+
+    # Mode 2: single document (QP-T01-03-02 原文直接餵入，不用工具)
+    # 目的：確認 synthesis 能力，排除 retrieval 變因。
+    # 若 Mode 2 分數明顯高於 Mode 3，表示 agent 有 retrieval 問題；
+    # 若分數相近，表示瓶頸在 synthesis（PDF 線性化毀掉表格結構）。
+    python -m rag.proto1_direct "如何辦理休學" --mode 2
+
+    # Verbose (shows tool calls summary, Mode 3 only)
+    python -m rag.proto1_direct "如何辦理休學" --verbose
+
+    # Debug (shows complete tool outputs without truncation, Mode 3 only)
+    python -m rag.proto1_direct "如何辦理休學" --debug
 
     # OpenRouter
-    LLM_PROVIDER=openrouter python rag/proto1_direct.py "如何辦理休學"
-
-    # Verbose (shows tool calls)
-    python rag/proto1_direct.py "如何辦理休學" --verbose
+    LLM_PROVIDER=openrouter python -m rag.proto1_direct "如何辦理休學"
 """
 
 import json
 import sys
 
 from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form
-from rag.llm_client import chat_with_tools, get_active_model, PROVIDER
+from rag.llm_client import chat_with_tools, simple_chat, get_active_model, PROVIDER
 from rag.eval import print_score_report
+
+# Mode 2 使用的表單 ID：休學申請書，蓋章流程主要來源
+_MODE2_FORM_ID = "QP-T01-03-02"
 
 TOOLS_SCHEMA = [
     {
@@ -112,6 +127,30 @@ SYSTEM_PROMPT = """你是國立政治大學（政大）的學務助理，使用�
 """
 
 
+def run_mode2(query: str) -> str:
+    """
+    Mode 2：單文件測試。
+
+    直接把 QP-T01-03-02（休學申請書）的原文餵給模型，不使用任何工具。
+    目的是隔離 retrieval 變因，單獨測試 synthesis 能力：
+      - 若此模式得分遠高於 Mode 3 → agent 的 retrieval 策略有問題
+      - 若得分相近             → 瓶頸在 synthesis（pdfplumber 線性化
+                                  毀掉了表格欄位結構，模型無法推斷 9 欄）
+    """
+    form = get_form(_MODE2_FORM_ID)
+    if "error" in form:
+        return f"（無法取得表單：{form['error']}）"
+
+    # 將表單原文包進 user message 作為唯一 context
+    context_message = (
+        f"以下是政大《{form.get('form_title', _MODE2_FORM_ID)}》"
+        f"（{_MODE2_FORM_ID}）的完整內容：\n\n"
+        f"{form['text']}\n\n"
+        f"根據上述資料，請回答：{query}"
+    )
+    return simple_chat(messages=[{"role": "user", "content": context_message}])
+
+
 def _dispatch(name: str, args: dict):
     if name == "grep_texts":    return grep_texts(**args)
     if name == "get_page":      return get_page(**args)
@@ -121,14 +160,19 @@ def _dispatch(name: str, args: dict):
     return {"error": f"Unknown tool: {name}"}
 
 
-def run_agent(query: str, max_turns: int = 10, verbose: bool = False) -> str:
+def run_agent(query: str, max_turns: int = 10, verbose: bool = False, debug: bool = False) -> str:
+    """
+    verbose: 每個 turn 的摘要（工具名稱 + 截斷結果）
+    debug:   每個 turn 的完整內容（含工具完整輸出，無截斷）；debug 包含 verbose 的所有資訊
+    """
     messages:    list[dict] = [{"role": "user", "content": query}]
     seen_calls:  list[str]  = []
     last_content: str | None = None
 
     for turn in range(max_turns):
-        if verbose:
-            print(f"\n[Turn {turn+1}]", file=sys.stderr)
+        if verbose or debug:
+            print(f"\n{'━'*60}", file=sys.stderr)
+            print(f"[Turn {turn+1}]", file=sys.stderr)
 
         content, tool_calls = chat_with_tools(
             messages=messages,
@@ -138,11 +182,15 @@ def run_agent(query: str, max_turns: int = 10, verbose: bool = False) -> str:
 
         # Final answer
         if not tool_calls:
+            if debug and content:
+                print(f"\n[Final answer — no tool calls]\n{content}", file=sys.stderr)
             return content or last_content or "（無回應）"
 
         if content:
             last_content = content
-            if verbose and content:
+            if debug:
+                print(f"[LLM reasoning]\n{content}", file=sys.stderr)
+            elif verbose:
                 print(f"  [LLM reasoning] {content[:200]}", file=sys.stderr)
 
         # Build assistant message for history
@@ -161,15 +209,33 @@ def run_agent(query: str, max_turns: int = 10, verbose: bool = False) -> str:
                     {"warning": "已搜尋過相同條件，請換不同關鍵字或工具"},
                     ensure_ascii=False,
                 )
-                if verbose:
+                if verbose or debug:
                     print(f"  [LOOP] {tc['function']['name']} repeated", file=sys.stderr)
             else:
                 seen_calls.append(call_sig)
                 args   = json.loads(tc["function"]["arguments"])
                 result = _dispatch(tc["function"]["name"], args)
                 result_str = json.dumps(result, ensure_ascii=False)
-                if verbose:
-                    fn = tc["function"]["name"]
+
+                fn = tc["function"]["name"]
+                if debug:
+                    print(f"\n[Tool call] {fn}", file=sys.stderr)
+                    print(f"  args: {args}", file=sys.stderr)
+                    if isinstance(result, list):
+                        print(f"  result: {len(result)} items", file=sys.stderr)
+                        for i, item in enumerate(result):
+                            print(f"  [{i}] {item.get('title','?')}", file=sys.stderr)
+                            print(f"       url: {item.get('url','')}", file=sys.stderr)
+                            if "snippet" in item:
+                                print(f"       snippet: {item['snippet']}", file=sys.stderr)
+                    elif isinstance(result, dict) and "text" in result:
+                        print(f"  result: {len(result['text'])} chars", file=sys.stderr)
+                        print(f"  full text:\n{result['text']}", file=sys.stderr)
+                    elif isinstance(result, dict) and "error" in result:
+                        print(f"  ERROR: {result['error']}", file=sys.stderr)
+                    else:
+                        print(f"  result: {result_str}", file=sys.stderr)
+                elif verbose:
                     print(f"  [{fn}] {args}", file=sys.stderr)
                     if isinstance(result, list):
                         print(f"    → {len(result)} items", file=sys.stderr)
@@ -191,14 +257,32 @@ def run_agent(query: str, max_turns: int = 10, verbose: bool = False) -> str:
 
 if __name__ == "__main__":
     verbose = "--verbose" in sys.argv
+    debug   = "--debug"   in sys.argv
+    mode    = int(sys.argv[sys.argv.index("--mode") + 1]) if "--mode" in sys.argv else 3
     args    = [a for a in sys.argv[1:] if not a.startswith("--")]
     query   = args[0] if args else "如何辦理休學"
 
     print(f"Provider : {PROVIDER}")
     print(f"Model    : {get_active_model()}")
+    mode_labels = {
+        1: "pure parametric — no tools, no context",
+        2: f"single document — {_MODE2_FORM_ID} only, no tools",
+        3: "full agentic RAG — 5 tools",
+    }
+    print(f"Mode     : {mode} ({mode_labels.get(mode, '?')})")
     print(f"Query    : {query}")
+    if debug:
+        print(f"Debug    : ON (complete tool outputs, no truncation)")
+    elif verbose:
+        print(f"Verbose  : ON (tool summary, truncated)")
     print("─" * 60)
 
-    answer = run_agent(query, verbose=verbose)
+    if mode == 1:
+        answer = simple_chat(messages=[{"role": "user", "content": query}])
+    elif mode == 2:
+        answer = run_mode2(query)
+    else:
+        answer = run_agent(query, verbose=verbose, debug=debug)
+
     print(answer)
     print_score_report(answer)
