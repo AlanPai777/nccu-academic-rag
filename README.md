@@ -1,22 +1,114 @@
 # NCCU Academic Affairs RAG Assistant
 
-A bilingual (Chinese/English) Retrieval-Augmented Generation (RAG) Q&A system for **National Chengchi University (NCCU)** academic affairs. Students and staff can ask natural-language questions about course registration, graduation requirements, academic regulations, and more — and receive grounded answers with cited sources.
+A bilingual (Chinese/English) Q&A system for **National Chengchi University (NCCU)** academic affairs. Students and staff can ask natural-language questions about course registration, graduation requirements, leave of absence procedures, and more — and receive grounded answers with cited sources.
+
+Two implementations are provided:
+
+| | Agentic RAG | Classic RAG |
+|---|---|---|
+| Entry point | `rag/proto1_direct.py` | `rag/main.py` |
+| Status | **Active development** | Stable |
+| Retrieval | LLM-driven tool loop (grep + page fetch) | Qdrant dense + FTS5 keyword → RRF |
+| Setup | Ollama or OpenRouter API key | 3 services + 40–60 min index build |
+| Data needed | `extracted_texts.jsonl` (included in repo) | Qdrant collection + FTS5 index |
 
 ---
 
-## Features
+## Agentic RAG (Active Development)
 
-- **Hybrid retrieval**: Qdrant dense search (top-25) + SQLite-FTS5 keyword search with jieba (top-15) → RRF fusion → top-5 chunks
-- **Two-layer caching**: SQLite-backed response cache (skip everything) and retrieval cache (skip search, run LLM only). Cache persists across restarts.
-- **Multilingual**: embeddinggemma embedding model handles Traditional Chinese and English queries
-- **Grounded answers**: qwen2.5:7b LLM generates answers strictly from retrieved context; refuses to hallucinate
-- **Dual LLM mode**: local `qwen2.5:7b` via Ollama (Intel GPU) or `gpt-oss-20b` via OpenRouter API (free tier)
-- **Intel GPU acceleration**: LLM inference accelerated via [ipex-llm Ollama](https://github.com/intel/ipex-llm) on Intel Arc / Core Ultra iGPU
-- **Web interface**: Gradio-based chat UI at `localhost:7860`
+### Architecture
+
+```
+Query
+  │
+  ▼
+run_agent() — up to 10 turns
+  │
+  ├── grep_texts(pattern, subdomain)   full-text search across extracted_texts.jsonl
+  ├── get_page(url)                    whole-page retrieval (no chunking)
+  ├── extract_links(url)               extract *.nccu.edu.tw links from a page
+  ├── get_children(url)                BFS child pages of a URL
+  └── get_form(form_id)                moltke/newdoc form full text (e.g. QP-T01-03-02)
+  │
+  ▼
+Synthesis → eval.py (26 pts, 13 criteria)
+```
+
+Inspired by [ELITE](https://github.com/tjzvbokbnft/ELITE-Embedding-Less-retrieval-with-Iterative-Text-Exploration) (iterative grep) and [LongRAG](https://arxiv.org/abs/2406.15319) (whole-page retrieval without chunking).
+
+### Quickstart
+
+```bash
+git clone <repo-url>
+cd nccu-academic-rag
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Configure API keys:**
+```bash
+cp .env.example .env
+# Edit .env — set LLM_PROVIDER and fill in the corresponding API key
+```
+
+**Option A — Ollama cloud (gemma4:31b, recommended):**
+```bash
+# 1. Sign in:  ollama signin   OR create a key at https://ollama.com/settings/keys
+# 2. In .env:  LLM_PROVIDER=ollama  /  OLLAMA_API_KEY=<your key>
+python -m rag.proto1_direct "如何辦理休學"
+```
+
+**Option B — OpenRouter API:**
+```bash
+# In .env:  LLM_PROVIDER=openrouter  /  OPENROUTER_API_KEY=<your key>
+python -m rag.proto1_direct "如何辦理休學"
+```
+
+No Qdrant, no embedding model, no index building required. `extracted_texts.jsonl` for all 15 subdomains is included in this repo (~92MB).
+
+### Running Modes
+
+```bash
+# Mode 3: full agentic RAG — agent loop with 5 tools (default)
+python -m rag.proto1_direct "如何辦理休學"
+
+# Mode 1: pure parametric — no tools, no RAG (baseline)
+python -m rag.proto1_direct "如何辦理休學" --mode 1
+
+# Mode 2: single document — QP-T01-03-02 fed directly (synthesis test)
+python -m rag.proto1_direct "如何辦理休學" --mode 2
+
+# Debug: full tool outputs per turn
+python -m rag.proto1_direct "如何辦理休學" --debug
+```
+
+Eval runs automatically after each query (26 pts, 13 criteria).
+
+### Eval Scores — "如何辦理休學"
+
+| Mode | Model | Score | Notes |
+|---|---|---|---|
+| Mode 3 (full agent) | Sonnet 4.6 | 26/26 | Gold standard |
+| Mode 3 (full agent) | Gemma4:31b | 13–15/26 | 4 tool calls; OSA URL reliability varies |
+| Mode 2 (single doc) | Gemma4:31b | 13/26 | QP-T01-03-02 only; tests synthesis |
+| Mode 1 (parametric) | Gemma4:31b | 7/26 | No retrieval |
+
+### Key Modules
+
+| Module | Role |
+|---|---|
+| `rag/agent_tools.py` | 5 core tools; reads from `output/*/extracted_texts.jsonl` |
+| `rag/proto1_direct.py` | Agent loop + Mode 1/2/3 + `--verbose`/`--debug` |
+| `rag/llm_client.py` | Unified LLM client: Ollama + OpenRouter; `max_tokens` defaults to 8192 |
+| `rag/eval.py` | 26 pts, 13 criteria (v2, 2026-05-02) |
+| `rag/skills/office_lookup_skill.py` | KNOWN_CONTACTS (~18 staff, Playwright-extracted) + KNOWN_FLOORS + extracted_texts lookup |
+| `rag/skills/procedure_skill.py` | Keyword detection for procedure-type questions |
 
 ---
 
-## Architecture
+## Classic RAG (Stable)
+
+### Architecture
 
 ```
 Query
@@ -44,74 +136,6 @@ Query
 Answer + Source URLs
 ```
 
----
-
-## Tech Stack
-
-| Component | Technology | Notes |
-|---|---|---|
-| Embedding | `embeddinggemma` (Gemma3-based) | 768-dim dense, 300M params, CPU via standalone Ollama |
-| Vector DB | Qdrant (binary) | ~14,430 points, cosine similarity |
-| Keyword search | SQLite-FTS5 + jieba | BM25 ranking, Chinese word segmentation |
-| Fusion | Reciprocal Rank Fusion (RRF) | k=60, replaces cross-encoder reranker, <1ms |
-| LLM (local) | `qwen2.5:7b` via Ollama | Runs on Intel GPU (ipex-llm) |
-| LLM (API) | `gpt-oss-20b` via OpenRouter | Free tier, 200 req/day |
-| GPU Acceleration | ipex-llm Ollama | Intel Arc / Core Ultra iGPU |
-| RAG Framework | LlamaIndex (retriever layer) | OllamaEmbedding, QdrantVectorStore, QueryFusionRetriever |
-| Web UI | Gradio 6.x | Bilingual chat interface |
-| HTML parsing | BeautifulSoup + lxml | Removes nav/footer noise; preserves markdown links |
-| PDF parsing | pdfplumber | Traditional Chinese support |
-| Cache | SQLite (two-layer) | Response + retrieval cache, persists across restarts |
-
----
-
-## Dataset
-
-The knowledge base is built from 6 NCCU subdomains crawled with a custom BFS web crawler, plus supplementary PDFs fetched from moltke.nccu.edu.tw and newdoc.nccu.edu.tw.
-
-### Coverage
-
-| Subdomain | Office | Extracted records | Supplementary PDFs |
-|---|---|---|---|
-| `aca.nccu.edu.tw` | Academic Affairs (教務處) | 6,243 | 40 (moltke + newdoc) |
-| `osa.nccu.edu.tw` | Student Affairs (學務處) | 9,374 | 46 (moltke + newdoc) |
-| `www.lib.nccu.edu.tw` | Library (圖書館) | 3,161 | 32 (moltke + newdoc + ref.lib) |
-| `learning.nccu.edu.tw` | Teaching & Learning Center | 4,669 | — |
-| `nccuga.nccu.edu.tw` | General Affairs (總務處) | 156 | — |
-| `oic.nccu.edu.tw` | International Cooperation (國際合作事務處) | 340 | — |
-| **Total** | | **23,943** | **118** |
-
-### Topics Covered
-
-- **Course Registration** — credit limits, add/drop deadlines, cross-school enrollment, summer courses
-- **Academic Records** — grade policies, transcripts, honor rolls, academic warnings
-- **Graduation** — requirements for bachelor's / master's / doctoral degrees, thesis submission, degree application
-- **Leave of Absence** — suspension, reinstatement, withdrawal procedures
-- **Double Major / Minor / Programs** — application requirements and procedures
-- **Tuition & Fees** — fee schedules, payment deadlines, refund policies
-- **Student Affairs** — scholarship applications, dormitory forms, student clubs, counseling services
-- **Library Services** — borrowing rules, database access, room booking, interlibrary loan forms
-- **Research Databases** — guides for Web of Science, Scopus, TEJ, LSEG, Turnitin, Bloomberg, SciVal, LawBank
-- **International Students** — exchange programs, visiting student applications, OIC services
-- **Teaching & Learning** — course development resources, TA guidelines, teaching evaluation
-- **Academic Regulations** — full text of university academic bylaws (PDF) with official forms
-- **Forms & Downloads** — 118 official application forms (PDF) with direct download links preserved
-
-Both **Traditional Chinese** and **English** versions of pages are included where available.
-
-### Data Availability
-
-Crawled HTML/PDF files and `rag/chunks.jsonl` are **not included** in this repository due to size. To reproduce:
-
-1. Crawl each subdomain using the [NCCU-Crawler](https://github.com/alanpai/NCCU-Crawler)
-2. Run `python rag/preprocess_all.py --subdomain <name>` for each subdomain
-3. Run `python rag/build_chunks.py` to generate `rag/chunks.jsonl`
-4. Run `python rag/main.py --build-index` to index into Qdrant and build the FTS5 keyword index
-
----
-
-## Setup
-
 ### Prerequisites — 3 services required
 
 | Service | How to start | Port |
@@ -120,60 +144,96 @@ Crawled HTML/PDF files and `rag/chunks.jsonl` are **not included** in this repos
 | ipex-llm Ollama (LLM) | `cd ~/ollama-ipex-llm-*/ && ./start-ollama.sh` | 11434 |
 | Standalone Ollama (embedding) | `OLLAMA_HOST=0.0.0.0:11435 /usr/local/bin/ollama serve` | 11435 |
 
-Pull the required models:
 ```bash
-# From the ipex-llm Ollama directory (port 11434)
 ./ollama pull qwen2.5:7b
-
-# From standalone Ollama (port 11435)
 OLLAMA_HOST=localhost:11435 ollama pull embeddinggemma
 ```
 
-Two separate Ollama instances are required because embeddinggemma (Gemma3 architecture) is incompatible with the ipex-llm SYCL backend, and embedding + LLM cannot coexist in memory (each ~5GB on 16GB RAM). `keep_alive=0` on embedding requests ensures the embedding model is unloaded before the LLM is needed.
+Two separate Ollama instances are required because embeddinggemma (Gemma3 architecture) is incompatible with the ipex-llm SYCL backend, and embedding + LLM cannot coexist in 16GB RAM (`keep_alive=0` ensures the embedding model is unloaded before the LLM is needed).
 
-### Installation
+### Building the Index
 
 ```bash
-git clone <repo-url>
-cd nccu-academic-rag
-
-python3 -m venv venv
-source venv/bin/activate
-
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-```
-
-### Building the index
-
-**Step 1 — Build chunks from crawled data** (skip if you already have `rag/chunks.jsonl`):
-```bash
+# Step 1 — build chunks (skip if rag/chunks.jsonl already exists)
 python rag/build_chunks.py
-# Output: rag/chunks.jsonl (~14,430 chunks with text + text_clean dual fields)
-```
+# Output: rag/chunks.jsonl (~14,430 chunks, text + text_clean dual fields)
 
-**Step 2 — Index into Qdrant and build FTS5:**
-```bash
+# Step 2 — index into Qdrant + FTS5 (~40-60 min)
 python rag/main.py --build-index
-# Embeds all chunks (embeddinggemma, CPU) and builds SQLite FTS5 index.
-# Takes ~40-60 min. Qdrant collection: nccu_aca_v2_embeddinggemma (768-dim)
 ```
 
 ### Running
 
-**Web UI:**
 ```bash
-python rag/main.py --app
-# Open http://localhost:7860
+python rag/main.py --app                                        # web UI (localhost:7860)
+python rag/main.py --query "選課最多可以修幾學分？"
+python rag/main.py --query "選課辦法" --provider openrouter    # OpenRouter API
+python rag/main.py --query "選課辦法" --no-cache               # bypass cache
 ```
 
-**CLI:**
-```bash
-python rag/main.py --query "選課最多可以修幾學分？"
-python rag/main.py --query "What are the graduation requirements?"
-python rag/main.py --query "選課辦法" --provider openrouter   # use API instead
-python rag/main.py --query "選課辦法" --no-cache              # bypass cache
-```
+### Performance
+
+| Stage | Device | Latency |
+|---|---|---|
+| Query embedding | CPU (port 11435) | 1–3s |
+| Qdrant dense search | In-memory | <1s |
+| FTS5 keyword search | CPU | <50ms |
+| RRF fusion | CPU | <1ms |
+| LLM generation (qwen2.5:7b) | Intel GPU (port 11434) | 40–90s |
+| **Cache hit (response)** | — | **<50ms** |
+| **First query (cold)** | — | **~1.5–3 min** |
+
+---
+
+## Dataset
+
+### Coverage
+
+| Subdomain | Office | Records |
+|---|---|---|
+| `aca.nccu.edu.tw` | Academic Affairs / 教務處 | 6,221 |
+| `osa.nccu.edu.tw` | Student Affairs / 學務處 | 9,374 |
+| `www.lib.nccu.edu.tw` | Library / 圖書館 | 3,161 |
+| `learning.nccu.edu.tw` | Teaching & Learning Center | 4,669 |
+| `oic.nccu.edu.tw` | International Cooperation / 國合處 | 340 |
+| `nccuga.nccu.edu.tw` | General Affairs / 總務處 (main) | 156 |
+| `cashier.nccu.edu.tw` | Cashier / 出納組 | 103 |
+| `dean.nccu.edu.tw` | Dean's Office / 總務長室 | 46 |
+| `docu.nccu.edu.tw` | Document Management / 文書組 | 157 |
+| `aff.nccu.edu.tw` | General Affairs / 事務組 | 135 |
+| `environ.nccu.edu.tw` | Environment / 環安組 | 335 |
+| `wealth.nccu.edu.tw` | Asset Management / 財產組 | 281 |
+| `mend.nccu.edu.tw` | Maintenance / 修繕組 | 94 |
+| `police.nccu.edu.tw` | Campus Police / 警衛隊 | 93 |
+| `cpds.nccu.edu.tw` | Procurement / 採購組 | 66 |
+| **Total** | | **25,231** |
+
+Supplementary PDFs (official forms from moltke.nccu.edu.tw and newdoc.nccu.edu.tw): ~118 forms across aca, osa, and www.lib.
+
+> **Note:** HTML pages under nccuga sub-units (cashier, dean, docu, etc.) are JavaScript-rendered; only PDF documents are extractable. Staff contact information for these offices is hardcoded in `OfficeLookupSkill` via Playwright extraction.
+
+### Topics Covered
+
+- **Course Registration** — credit limits, add/drop deadlines, cross-school enrollment
+- **Academic Records** — grade policies, transcripts, academic warnings
+- **Graduation** — bachelor's / master's / doctoral requirements, thesis submission
+- **Leave of Absence** — suspension, reinstatement, withdrawal procedures and forms
+- **Tuition & Fees** — schedules, refund policies (full / 2/3 / 1/3 by week)
+- **Student Affairs** — scholarships, dormitory, clubs, counseling
+- **Library Services** — borrowing rules, database access, interlibrary loan
+- **International Students** — exchange programs, OIC services
+- **General Affairs** — facilities, campus safety, procurement
+- **Academic Regulations** — full bylaws (PDF) with official application forms
+
+### Data Availability
+
+`extracted_texts.jsonl` (preprocessed text, ~92MB total) and `supplementary_map.json` (moltke/newdoc form index) for all 15 subdomains are **included in this repository** — no crawling required to run the agentic RAG.
+
+Raw HTML/PDF files (~8.5GB) are excluded. To reproduce from scratch:
+1. Crawl each subdomain using [NCCU-Crawler](https://github.com/alanpai/NCCU-Crawler)
+2. `python rag/preprocess_all.py` — regenerate `extracted_texts.jsonl`
+3. `python rag/build_chunks.py` — regenerate `rag/chunks.jsonl` (classic RAG only)
+4. `python rag/main.py --build-index` — rebuild Qdrant + FTS5 (classic RAG only)
 
 ---
 
@@ -181,38 +241,32 @@ python rag/main.py --query "選課辦法" --no-cache              # bypass cache
 
 ```
 rag/
-├── preprocess.py       # HTML/PDF content extraction; preserves markdown links [text](url)
-├── preprocess_all.py   # Batch extraction → output/<subdomain>/extracted_texts.jsonl
-├── chunker.py          # HTML chunking (800 chars, link-aware); PDF chunking (512 tokens)
-├── build_chunks.py     # Batch pipeline → chunks.jsonl (with text + text_clean fields)
-├── embedder.py         # embeddinggemma via Ollama REST API (port 11435)
-├── indexer.py          # Qdrant collection creation + FTS5 index build
-├── keyword_store.py    # SQLite-FTS5 BM25 keyword search with jieba segmentation
-├── retriever.py        # LlamaIndex hybrid retrieval: dense + keyword → RRF fusion
-├── cache.py            # Two-layer SQLite cache: response + retrieval (persistent)
-├── generator.py        # LLM generation: local qwen2.5:7b or OpenRouter API
-├── pipeline.py         # End-to-end pipeline: cache → retrieve → generate
-├── main.py             # CLI entry point
-└── app.py              # Gradio web UI
+├── proto1_direct.py        # Agentic RAG: agent loop, Mode 1/2/3, --verbose/--debug
+├── agent_tools.py          # 5 tools: grep_texts, get_page, extract_links, get_children, get_form
+├── llm_client.py           # Unified LLM client: Ollama + OpenRouter
+├── eval.py                 # Evaluation: 26 pts, 13 criteria (v2)
+├── skills/
+│   ├── office_lookup_skill.py  # KNOWN_CONTACTS + KNOWN_FLOORS + extracted_texts lookup
+│   └── procedure_skill.py      # Keyword detection for procedure-type questions
+├── preprocess.py           # HTML/PDF extraction; smart table → Markdown; OCR fallback
+├── preprocess_all.py       # Batch extraction → output/<subdomain>/extracted_texts.jsonl
+├── chunker.py              # HTML (800 chars) + PDF (512 tokens) chunking
+├── build_chunks.py         # → rag/chunks.jsonl (classic RAG)
+├── embedder.py             # embeddinggemma via Ollama (port 11435)
+├── indexer.py              # Qdrant collection + FTS5 index build
+├── keyword_store.py        # SQLite-FTS5 + jieba BM25
+├── retriever.py            # LlamaIndex hybrid: dense + keyword → RRF fusion
+├── cache.py                # Two-layer SQLite cache (response + retrieval)
+├── generator.py            # LLM generation: qwen2.5:7b or OpenRouter
+├── pipeline.py             # Classic RAG end-to-end
+├── main.py                 # Classic RAG CLI entry point
+└── app.py                  # Gradio web UI
+
+output/
+└── <subdomain>/
+    ├── extracted_texts.jsonl   # Preprocessed text (tracked in git, ~92MB total)
+    └── supplementary_map.json  # Moltke/newdoc form index (tracked in git)
 ```
-
----
-
-## Performance
-
-| Stage | Device | Latency |
-|---|---|---|
-| Query embedding (embeddinggemma) | CPU (port 11435) | 1–3s |
-| Qdrant dense search | In-memory | <1s |
-| FTS5 keyword search | CPU | <50ms |
-| RRF fusion | CPU | <1ms |
-| LLM generation (qwen2.5:7b) | Intel GPU (port 11434) | 40–90s |
-| **Cache hit (response)** | — | **<50ms** |
-| **Cache hit (retrieval)** | — | **~40–90s (LLM only)** |
-| **First query (cold, no cache)** | | **~1.5–3 min** |
-| **Repeated queries** | | **<50ms (cached)** |
-
-RRF replaced the previous bge-reranker-v2-m3 cross-encoder (5–10 min on CPU), reducing uncached query time from 7–10 min to ~1.5–3 min.
 
 ---
 
