@@ -1,5 +1,9 @@
 # Crawler output data (large files, not source code)
-output/
+# Keep only preprocessed text (~92MB); exclude HTML, PDF, logs (~8.5GB)
+output/**
+!output/*/
+!output/*/extracted_texts.jsonl
+!output/*/supplementary_map.json
 
 # Generated RAG data (regeneratable from output/)
 rag/chunks.jsonl
