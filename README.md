@@ -4,35 +4,51 @@ A bilingual (Chinese/English) Q&A system for **National Chengchi University (NCC
 
 Two implementations are provided:
 
-| | Agentic RAG | Classic RAG |
-|---|---|---|
-| Entry point | `rag/proto1_direct.py` | `rag/main.py` |
-| Status | **Active development** | Stable |
-| Retrieval | LLM-driven tool loop (grep + page fetch) | Qdrant dense + FTS5 keyword → RRF |
-| Setup | Ollama or OpenRouter API key | 3 services + 40–60 min index build |
-| Data needed | `extracted_texts.jsonl` (included in repo) | Qdrant collection + FTS5 index |
+| | Agentic RAG (Proto 3) | Agentic RAG (Proto 1) | Classic RAG |
+|---|---|---|---|
+| Entry point | `rag/proto3_langgraph.py` | `rag/proto1_direct.py` | `rag/main.py` |
+| Status | **Active development** | Baseline / reference | Stable |
+| Retrieval | LangGraph pipeline: router → skill → synthesis | LLM-driven tool loop | Qdrant dense + FTS5 → RRF |
+| Setup | Ollama or OpenRouter API key | Ollama or OpenRouter API key | 3 services + 40–60 min index build |
+| Data needed | `extracted_texts.jsonl` (included) | `extracted_texts.jsonl` (included) | Qdrant collection + FTS5 index |
 
 ---
 
 ## Agentic RAG (Active Development)
 
-### Architecture
+### Architecture — Proto 3 (LangGraph)
 
 ```
 Query
   │
   ▼
-run_agent() — up to 10 turns
+router_node — 2-layer: keyword match → LLM fallback
   │
-  ├── grep_texts(pattern, subdomain)   full-text search across extracted_texts.jsonl
-  ├── get_page(url)                    whole-page retrieval (no chunking)
-  ├── extract_links(url)               extract *.nccu.edu.tw links from a page
-  ├── get_children(url)                BFS child pages of a URL
-  └── get_form(form_id)                moltke/newdoc form full text (e.g. QP-T01-03-02)
-  │
-  ▼
-Synthesis → eval.py (26 pts, 13 criteria)
+  ├─(PROCEDURE)──▶ retrieval_node (ProcedureSkill: grep → links → form)
+  ├─(KNOWLEDGE)──▶ retrieval_node (LLM agent loop, up to 10 turns)
+  │                  ├── grep_texts(pattern, subdomain)
+  │                  ├── get_page(url)
+  │                  ├── extract_links(url)
+  │                  ├── get_children(url)
+  │                  └── get_form(form_id)
+  └─(CONTACT)────▶ office_lookup_node (skip retrieval)
+                        │
+                   office_lookup_node — OfficeLookupSkill (KNOWN_CONTACTS, always-on)
+                        │
+                   synthesis_node ◀──────────────────────╮
+                        │                                │ correction_hint (max 2 retries)
+                   self_eval_node ──(retry if FAIL)──────╯
+                        │
+                       END
 ```
+
+**Phase E features** (2026-05-14):
+- **E1** Query router: keyword layer → LLM fallback [Adaptive-RAG]
+- **E3** KNOWN_CONTACTS always-on injection (not dependent on grep success)
+- **E4** Self-eval node: correction_hint + retry loop [Self-RAG]
+- **E5** Doom Loop Detector: max turns + duplicate call detection + format validation
+- **E6** Staleness warning appended to every answer [Astute RAG]
+- **E7** Parametric knowledge fallback when retrieval finds nothing [Astute RAG]
 
 Inspired by [ELITE](https://github.com/tjzvbokbnft/ELITE-Embedding-Less-retrieval-with-Iterative-Text-Exploration) (iterative grep) and [LongRAG](https://arxiv.org/abs/2406.15319) (whole-page retrieval without chunking).
 
@@ -55,54 +71,57 @@ cp .env.example .env
 ```bash
 # 1. Sign in:  ollama signin   OR create a key at https://ollama.com/settings/keys
 # 2. In .env:  LLM_PROVIDER=ollama  /  OLLAMA_API_KEY=<your key>
-python -m rag.proto1_direct "如何辦理休學"
+python -m rag.proto3_langgraph "如何辦理休學"
 ```
 
 **Option B — OpenRouter API:**
 ```bash
 # In .env:  LLM_PROVIDER=openrouter  /  OPENROUTER_API_KEY=<your key>
-python -m rag.proto1_direct "如何辦理休學"
+python -m rag.proto3_langgraph "如何辦理休學"
 ```
 
 No Qdrant, no embedding model, no index building required. `extracted_texts.jsonl` for all 15 subdomains is included in this repo (~92MB).
 
-### Running Modes
+### Running
 
 ```bash
-# Mode 3: full agentic RAG — agent loop with 5 tools (default)
-python -m rag.proto1_direct "如何辦理休學"
+# Proto 3 (LangGraph, recommended)
+python -m rag.proto3_langgraph "如何辦理休學"
+python -m rag.proto3_langgraph "出納組的電話"
+python -m rag.proto3_langgraph "選課上限幾學分"
+python -m rag.proto3_langgraph "如何辦理休學" --no-eval
 
-# Mode 1: pure parametric — no tools, no RAG (baseline)
-python -m rag.proto1_direct "如何辦理休學" --mode 1
-
-# Mode 2: single document — QP-T01-03-02 fed directly (synthesis test)
-python -m rag.proto1_direct "如何辦理休學" --mode 2
-
-# Debug: full tool outputs per turn
-python -m rag.proto1_direct "如何辦理休學" --debug
+# Proto 1 (simple agent loop, baseline)
+python -m rag.proto1_direct "如何辦理休學"           # Mode 3: full agent (default)
+python -m rag.proto1_direct "如何辦理休學" --mode 1  # Mode 1: pure parametric
+python -m rag.proto1_direct "如何辦理休學" --mode 2  # Mode 2: single doc (synthesis test)
+python -m rag.proto1_direct "如何辦理休學" --debug   # full tool outputs per turn
 ```
 
 Eval runs automatically after each query (26 pts, 13 criteria).
 
 ### Eval Scores — "如何辦理休學"
 
-| Mode | Model | Score | Notes |
+| Pipeline | Model | Score | Notes |
 |---|---|---|---|
-| Mode 3 (full agent) | Sonnet 4.6 | 26/26 | Gold standard |
-| Mode 3 (full agent) | Gemma4:31b | 13–15/26 | 4 tool calls; OSA URL reliability varies |
-| Mode 2 (single doc) | Gemma4:31b | 13/26 | QP-T01-03-02 only; tests synthesis |
-| Mode 1 (parametric) | Gemma4:31b | 7/26 | No retrieval |
+| Proto 3 (LangGraph) | Gemma4:31b | **26/26** | Phase E complete (2026-05-14) |
+| Proto 1 Mode 3 (full agent) | Sonnet 4.6 | 26/26 | Gold standard |
+| Proto 1 Mode 3 (full agent) | Gemma4:31b | 13–15/26 | 4 tool calls; no router/self-eval |
+| Proto 1 Mode 2 (single doc) | Gemma4:31b | 13/26 | QP-T01-03-02 only; tests synthesis |
+| Proto 1 Mode 1 (parametric) | Gemma4:31b | 7/26 | No retrieval |
 
 ### Key Modules
 
 | Module | Role |
 |---|---|
-| `rag/agent_tools.py` | 5 core tools; reads from `output/*/extracted_texts.jsonl` |
-| `rag/proto1_direct.py` | Agent loop + Mode 1/2/3 + `--verbose`/`--debug` |
+| `rag/proto3_langgraph.py` | LangGraph pipeline: router → retrieval → office_lookup → synthesis → self_eval |
+| `rag/router.py` | 2-layer query router: keyword match → LLM fallback (PROCEDURE / CONTACT / KNOWLEDGE) |
+| `rag/agent_tools.py` | 5 core tools: `grep_texts`, `get_page`, `extract_links`, `get_children`, `get_form` |
+| `rag/proto1_direct.py` | Baseline agent loop + Mode 1/2/3 + `--verbose`/`--debug` |
 | `rag/llm_client.py` | Unified LLM client: Ollama + OpenRouter; `max_tokens` defaults to 8192 |
 | `rag/eval.py` | 26 pts, 13 criteria (v2, 2026-05-02) |
 | `rag/skills/office_lookup_skill.py` | KNOWN_CONTACTS (~18 staff, Playwright-extracted) + KNOWN_FLOORS + extracted_texts lookup |
-| `rag/skills/procedure_skill.py` | Keyword detection for procedure-type questions |
+| `rag/skills/procedure_skill.py` | ProcedureSkill: deterministic 3-step retrieval (grep → links → form) |
 
 ---
 
