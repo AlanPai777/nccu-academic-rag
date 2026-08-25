@@ -3,7 +3,9 @@
 output/**
 !output/*/
 !output/*/extracted_texts.jsonl
+!output/*/extracted_supplementary.jsonl
 !output/*/supplementary_map.json
+!output/office_contacts_index.jsonl
 
 # Generated RAG data (regeneratable from output/)
 rag/chunks.jsonl
