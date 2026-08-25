@@ -2,6 +2,7 @@
 httpx
 beautifulsoup4
 lxml
+playwright  # JS-rendered re-crawl (Phase F Step 0c); after install run: playwright install chromium
 
 # Document parsing
 pdfplumber

@@ -165,15 +165,30 @@ def _parse_soup(soup: BeautifulSoup, url: str = "") -> str:
 
     # Also remove Joomla-specific navigation/breadcrumb wrappers, but never
     # decompose <body>/<html> themselves even if a stray class happens to match.
-    for tag in soup.find_all(class_=re.compile(r"nav|menu|breadcrumb|sidebar|footer|header", re.I)):
+    # Delimiter-anchored, not a bare substring search: page builders (Avia/Enfold,
+    # confirmed on mepa.nccu.edu.tw) emit auto-generated element IDs like
+    # "av-4naveu-857d169d..." where "nav" appears mid-word by coincidence of the
+    # hash — a bare substring match decomposed the entire bio content on that
+    # page. Requiring a start/end/hyphen/underscore boundary around the keyword
+    # still matches genuine tokens ("nav-wrapper", "site-header", "footer_text")
+    # but not accidental mid-word hits.
+    _NOISE_CLASS_RE = re.compile(
+        r"(?:^|[-_])(?:nav|menu|breadcrumb|sidebar|footer|header)(?:$|[-_])", re.I
+    )
+    for tag in soup.find_all(class_=_NOISE_CLASS_RE):
         if tag.name in ("body", "html"):
             continue
         tag.decompose()
 
-    # Try Joomla content area first, then PageOne CMS
+    # Try Joomla content area first, then PageOne CMS, then WordPress
+    # Avia/Enfold theme (confirmed on mepa.nccu.edu.tw and foreign.nccu.edu.tw
+    # via Step 0c contact.csv crawl — <main>/<article> on these sites only
+    # wrap a near-empty page-transition shell, real content lives in this class).
     content = soup.find("div", class_="item-page")
     if not content:
         content = soup.find("div", class_="page-inner")
+    if not content:
+        content = soup.find("div", class_="all_colors")
     if not content:
         content = soup.find("main")
     if not content:
