@@ -30,7 +30,7 @@ from langgraph.graph import StateGraph, START, END
 
 from rag.router import route, QueryType
 from rag.llm_client import chat_with_tools, simple_chat, get_active_model, PROVIDER
-from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form
+from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form, extract_form_ids
 from rag.skills.procedure_skill import ProcedureSkill
 from rag.eval import print_score_report
 
@@ -38,15 +38,16 @@ from rag.eval import print_score_report
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
-    query:           str
-    query_type:      str        # "procedure" / "contact" / "knowledge"
-    route_method:    str        # "keyword" / "llm" / "default"
-    context_pages:   list[dict] # retrieved pages (PROCEDURE / KNOWLEDGE)
-    office_context:  str        # formatted contact info — E3: OfficeLookupSkill
-    answer:          str        # final answer
-    sources:         list[str]  # cited URLs
-    correction_hint: str        # E4: self-eval feedback for synthesis retry
-    iteration:       int        # E4: retry counter (max _MAX_SELF_EVAL_RETRIES)
+    query:                str
+    query_type:           str        # "procedure" / "contact" / "knowledge"
+    route_method:         str        # "keyword" / "llm" / "default"
+    context_pages:        list[dict] # retrieved pages (PROCEDURE / KNOWLEDGE)
+    office_context:       str        # formatted contact info — E3: OfficeLookupSkill
+    extraction_checklist: dict       # condition 6: pre-synthesis dynamic checklist
+    answer:               str        # final answer
+    sources:              list[str]  # cited URLs
+    correction_hint:      str        # E4: self-eval feedback for synthesis retry
+    iteration:            int        # E4: retry counter (max _MAX_SELF_EVAL_RETRIES)
 
 
 # ── Tool schema ───────────────────────────────────────────────────────────────
@@ -145,7 +146,7 @@ _SYNTHESIS_PROMPT = """\
 {office_section}【搜尋到的頁面內容】
 {context}
 
----
+{checklist_section}---
 
 學生問題：{query}
 
@@ -154,13 +155,12 @@ _SYNTHESIS_PROMPT = """\
 【回答格式規則】
 1. 申辦流程問題：以**步驟清單**格式回答，每站必須列出：辦理單位、地點（行政大樓 X 樓）、電話分機、**承辦人姓名（必填，從上方聯絡資訊引用）**及職責
 2. 條件限定步驟請明確標注（如：住宿生需辦、國際學生需辦）
-3. 教務處步驟需明確列出三層審核：承辦人 → 組長批示 → 教務長核准
-4. 若有退費標準，列出退費比例表（全額 / 2/3 / 1/3 / 不退）
-5. 若有補充表單（如委託書 QP-T01-02-05、提早復學 QP-T01-03-04），請一併列出
-6. 說明核准後的取件方式與時效（如：三個工作天後可領取 / 郵寄 / iNCCU 系統查詢）
-7. 若資料中提及身心健康中心，請附上電話
-8. 回答最後以「【引用來源】」列出所有使用到的 URL
-9. 資料不足時說「無法確認」，不猜測
+3. 若有退費標準，列出退費比例表（全額 / 2/3 / 1/3 / 不退）
+4. 說明核准後的取件方式與時效（如：三個工作天後可領取 / 郵寄 / iNCCU 系統查詢）——若資料中沒有提及，不要猜測
+5. 回答最後以「【引用來源】」列出所有使用到的 URL
+6. 資料不足時說「無法確認」，不猜測
+
+⚠️ 審核層級、蓋章單位數量、是否需要補充表單等流程細節，**一律只依據上方【搜尋到的頁面內容】與 checklist 實際列出的內容回答**，不要套用你對其他申辦流程（例如休學）的既有印象去補全或類推——不同流程的審核層級可能不同，checklist 沒列出的層級就是沒有，不要自行加上。
 """
 
 
@@ -330,12 +330,100 @@ def office_lookup_node(state: AgentState) -> AgentState:
     return {**state, "office_context": skill.format_context(result)}
 
 
+# ── Condition 6: pre-synthesis dynamic checklist ─────────────────────────────
+# Matches OfficeLookupSkill.format_context()'s per-contact line format exactly:
+# "    • {name}（{duty}）分機 {ext}" (see rag/skills/office_lookup_skill.py).
+_PERSON_LINE_RE = re.compile(r'•\s*([^\s（]+)（([^）]*)）分機\s*(\d{4,5})')
+
+
+def extraction_node(state: AgentState) -> AgentState:
+    """
+    Condition 6: build a fact checklist from what retrieval/office_lookup
+    actually found, BEFORE synthesis — v1 is pure regex, zero extra LLM calls.
+
+    person_names: parsed from office_context's structured "• 姓名（職責）分機
+                   XXXXX" lines (not hardcoded — reflects whichever offices
+                   this specific query actually pulled in).
+    forms:        form IDs parsed from context_pages text via agent_tools.extract_form_ids()
+                   (reused, not reimplemented), each paired with its title when
+                   the form's own page is in context_pages — lets the LLM judge
+                   relevance instead of guessing from a bare ID.
+
+    Replaces static content rules in _SYNTHESIS_PROMPT (old rules 3/5/7: fixed
+    3-layer 教務處 review, fixed supplementary-form list, fixed 身心健康中心
+    mention) with "here is what you found" — the LLM is told what's actually
+    in the data instead of being told what to say regardless of the query.
+    Directly targets the hallucination confirmed in Step 1 Q2 (復學 answer
+    fabricated a 教務長 approval layer that doesn't exist in QP-T01-03-04).
+    """
+    person_names: list[dict] = []
+    for name, duty, ext in _PERSON_LINE_RE.findall(state.get("office_context", "")):
+        person_names.append({"name": name, "duty": duty, "ext": ext})
+
+    context_pages = state.get("context_pages", [])
+
+    form_ids: set[str] = set()
+    for page in context_pages:
+        form_ids.update(extract_form_ids(page.get("text", "")))
+
+    # Attach a title to each form ID when its own page is in context_pages
+    # (true whenever ProcedureSkill actually called get_form() on it) — a bare
+    # ID like "QP-T01-03-05" gives the LLM nothing to judge relevance by; the
+    # title ("學生退學離校申請書") makes it obvious that one's a different
+    # procedure (退學, not 休學) and should be left out, while a form whose
+    # title clearly complements the question should be kept.
+    forms: list[dict] = []
+    for fid in sorted(form_ids):
+        title = next(
+            (p.get("title", "") for p in context_pages if fid in p.get("url", "")),
+            "",
+        )
+        forms.append({"id": fid, "title": title})
+
+    checklist = {
+        "person_names": person_names,
+        "forms":        forms,
+    }
+    print(
+        f"[extraction] {len(person_names)} person(s), "
+        f"forms={[(f['id'], f['title']) for f in forms]}",
+        file=sys.stderr,
+    )
+    return {**state, "extraction_checklist": checklist}
+
+
+def _format_checklist(checklist: dict) -> str:
+    """Format extraction_checklist into a prompt-injectable block, or "" if empty."""
+    if not checklist:
+        return ""
+
+    lines = ["【本次搜尋結果中實際找到的事實 checklist——以下項目若跟問題相關就必須出現在答案中，"
+              "不要遺漏；checklist 沒列出的人名/表單/審核層級也不要自行補上】"]
+
+    if checklist.get("person_names"):
+        lines.append("承辦人：")
+        for p in checklist["person_names"]:
+            lines.append(f"  • {p['name']}（{p['duty']}）分機 {p['ext']}")
+
+    if checklist.get("forms"):
+        lines.append("相關表單（逐一判斷是否與學生問題相關；標題明顯是同一流程或直接後續步驟的，"
+                     "必須在答案中列出，不可省略；標題明顯是不同流程的可以略過）：")
+        for f in checklist["forms"]:
+            title = f"（{f['title']}）" if f["title"] else ""
+            lines.append(f"  • {f['id']}{title}")
+
+    if len(lines) == 1:
+        return ""  # nothing extracted — omit the section entirely
+    return "\n".join(lines) + "\n\n"
+
+
 def synthesis_node(state: AgentState) -> AgentState:
     """
     Generate the final answer from retrieved context + office contact info.
 
     KNOWLEDGE: answer already produced by agent loop → pass through.
-    PROCEDURE / CONTACT: call LLM with context_pages + office_context.
+    PROCEDURE / CONTACT: call LLM with context_pages + office_context +
+    extraction_checklist (condition 6).
     On E4 retry: prepends correction_hint so the LLM knows what to fix.
     """
     if state["query_type"] == QueryType.KNOWLEDGE:
@@ -360,9 +448,12 @@ def synthesis_node(state: AgentState) -> AgentState:
     if context_str == "（無搜尋結果）" and not state.get("office_context"):
         return {**state, "answer": _parametric_fallback(state["query"]), "correction_hint": ""}
 
+    checklist_section = _format_checklist(state.get("extraction_checklist", {}))
+
     base_prompt = _SYNTHESIS_PROMPT.format(
         office_section=office_section,
         context=context_str,
+        checklist_section=checklist_section,
         query=state["query"],
     )
 
@@ -377,13 +468,12 @@ def synthesis_node(state: AgentState) -> AgentState:
 
 _MAX_SELF_EVAL_RETRIES = 2
 
+# person_names dropped from here — condition 6 made it dynamic (see self_eval_node
+# below): it now checks against extraction_checklist's actual person_names for
+# THIS query instead of a fixed list of 6 休學-specific names hardcoded regardless
+# of query type. sources/procedure_format stay static — they're format checks,
+# not content specific to any one procedure.
 _SELF_EVAL_CRITERIA = [
-    {
-        "name":     "person_names",
-        "keywords": ["盧誼甄", "王揚忠", "黃婉綝", "陳哲良", "林啓屏", "蕭毓璇"],
-        "min_hits": 2,
-        "hint":     "答案缺少承辦人姓名（需 ≥2 位）。請在每個步驟列出對應承辦人姓名（從【各辦公室聯絡資訊】引用）。",
-    },
     {
         "name":     "sources",
         "keywords": ["引用來源", "https://"],
@@ -422,15 +512,22 @@ def self_eval_node(state: AgentState) -> AgentState:
         hits = sum(1 for kw in check["keywords"] if kw in answer)
         if hits < check["min_hits"]:
             failures.append(check["hint"])
-    
+
+    # Condition 6: dynamic person_names check against this query's own
+    # extraction_checklist instead of a hardcoded 休學-specific name list.
+    checklist_names = [p["name"] for p in state.get("extraction_checklist", {}).get("person_names", [])]
+    if checklist_names:
+        required = min(2, len(checklist_names))
+        hits = sum(1 for name in checklist_names if name in answer)
+        if hits < required:
+            failures.append(
+                f"答案缺少承辦人姓名（需 ≥{required} 位，checklist 中找到：{'、'.join(checklist_names)}）。"
+                "請在每個步驟列出對應承辦人姓名（從【各辦公室聯絡資訊】引用）。"
+            )
+
     if not failures:
         return state  # all checks passed
-    '''
-    if not failures:
-        print("[self_eval] PASS — no retry needed", file=sys.stderr)
-        return state
-    print(f"[self_eval] FAIL — retry {state.get('iteration',0)+1}: {failures}", file=sys.stderr)
-    '''
+
     correction = (
         "【自評回饋：以下項目不符合要求，請重新生成更完整的答案】\n"
         + "\n".join(f"- {f}" for f in failures)
@@ -506,13 +603,15 @@ def build_graph():
     g.add_node("router_node",        router_node)
     g.add_node("retrieval_node",     retrieval_node)
     g.add_node("office_lookup_node", office_lookup_node)
+    g.add_node("extraction_node",    extraction_node)
     g.add_node("synthesis_node",     synthesis_node)
     g.add_node("self_eval_node",     self_eval_node)
 
     g.add_edge(START, "router_node")
     g.add_conditional_edges("router_node",    _after_router)
     g.add_edge("retrieval_node",     "office_lookup_node")
-    g.add_edge("office_lookup_node", "synthesis_node")
+    g.add_edge("office_lookup_node", "extraction_node")
+    g.add_edge("extraction_node",    "synthesis_node")
     g.add_edge("synthesis_node",     "self_eval_node")
     g.add_conditional_edges("self_eval_node", _after_self_eval)
 
@@ -528,15 +627,16 @@ def run(query: str) -> str:
         _graph = build_graph()
 
     final = _graph.invoke({
-        "query":           query,
-        "query_type":      "",
-        "route_method":    "",
-        "context_pages":   [],
-        "office_context":  "",
-        "answer":          "",
-        "sources":         [],
-        "correction_hint": "",
-        "iteration":       0,
+        "query":                query,
+        "query_type":           "",
+        "route_method":         "",
+        "context_pages":        [],
+        "office_context":       "",
+        "extraction_checklist": {},
+        "answer":               "",
+        "sources":              [],
+        "correction_hint":      "",
+        "iteration":            0,
     })
     # E6: append staleness warning (post-processing, not a graph node)
     return final["answer"] + _staleness_warning(final.get("context_pages", []))

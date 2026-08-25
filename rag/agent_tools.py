@@ -17,6 +17,21 @@ CRAWLER_OUTPUT = str(Path(__file__).parent.parent / "output")
 NCCU_LINK_RE   = re.compile(r'\[([^\]]+)\]\((https?://[^)]*\.nccu\.edu\.tw[^)]*)\)')
 FORM_ID_RE     = re.compile(r'QP-[A-Z0-9]+-[A-Z0-9]+-[A-Z0-9]+')
 
+
+def _extracted_paths(glob_pattern: str) -> list[str]:
+    """
+    glob.glob() on "extracted_*.jsonl" returns extracted_supplementary.jsonl
+    before extracted_texts.jsonl (plain alphabetical: "s" < "t") — for a
+    subdomain like aca where moltke form records in extracted_supplementary
+    outnumber matches on the same keyword in the subdomain's own pages,
+    grep_texts()'s un-ranked, first-N-results truncation let supplementary
+    content silently crowd out the richer primary page every time. Force
+    extracted_texts.jsonl (the subdomain's own content) first, so a capped
+    result list always fills from primary content before supplementary.
+    """
+    paths = glob.glob(glob_pattern)
+    return sorted(paths, key=lambda p: 0 if p.endswith("extracted_texts.jsonl") else 1)
+
 # Group names for multi-subdomain search (grep_texts group= parameter).
 SUBDOMAIN_GROUPS: dict[str, list[str]] = {
     "nccuga": ["nccuga", "cashier", "dean", "docu", "aff",
@@ -47,12 +62,12 @@ def grep_texts(
     Returns [{url, title, preview, subdomain}, ...]
     """
     if subdomain:
-        paths = glob.glob(f"{CRAWLER_OUTPUT}/{subdomain}/extracted_*.jsonl")
+        paths = _extracted_paths(f"{CRAWLER_OUTPUT}/{subdomain}/extracted_*.jsonl")
     elif group:
         subdomains = SUBDOMAIN_GROUPS.get(group, [])
-        paths = [p for s in subdomains for p in glob.glob(f"{CRAWLER_OUTPUT}/{s}/extracted_*.jsonl")]
+        paths = [p for s in subdomains for p in _extracted_paths(f"{CRAWLER_OUTPUT}/{s}/extracted_*.jsonl")]
     else:
-        paths = glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl")
+        paths = _extracted_paths(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl")
 
     results = []
     for path in paths:
@@ -94,7 +109,7 @@ def get_page(url: str) -> dict:
     """
     decoded = urllib.parse.unquote(url)
 
-    for path in glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl"):
+    for path in _extracted_paths(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl"):
         if not Path(path).exists():
             continue
         try:
