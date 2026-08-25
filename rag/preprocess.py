@@ -1,8 +1,9 @@
 """
 preprocess.py — Extract clean text from HTML and PDF files.
 
-HTML: locates div.item-page (Joomla main content area), strips nav/footer/scripts.
-PDF:  uses pdfplumber; returns empty string if text < 100 chars (likely scanned).
+HTML: locates div.item-page (Joomla) or div.page-inner (PageOne CMS), strips
+      nav/footer/scripts, appends footer contact/address info separately.
+PDF:  uses pdfplumber; falls back to OCR if extracted text < 10 chars (likely scanned).
 """
 
 import logging
@@ -10,7 +11,7 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 # pdfminer emits "Could not get FontBBox from font descriptor because None cannot be
 # parsed as 4 floats" for Type3 fonts that lack a FontBBox entry. These fonts are used
@@ -27,6 +28,11 @@ def _node_to_text(node, base_url: str) -> str:
     rendering <a href=...> tags as markdown [text](url) links.
     Relative URLs are resolved against base_url.
     """
+    if isinstance(node, Comment):
+        # HTML comments are a NavigableString subclass — must be excluded before
+        # the NavigableString check below, or their raw text leaks into output.
+        return ""
+
     if isinstance(node, NavigableString):
         return str(node)
 
@@ -91,28 +97,34 @@ def _decode_cf_emails_in_soup(soup: BeautifulSoup) -> None:
             span.replace_with(email)
 
 
-def extract_html(path: str | Path, url: str = "") -> str:
+def is_cloudflare_page(html_bytes: bytes) -> bool:
     """
-    Extract main content text from a downloaded HTML file.
+    Return True if the bytes are a Cloudflare challenge/interstitial page
+    rather than real content (e.g. under a temporary bot-check).
+    Checked against just the first 4KB — the challenge markers always appear
+    near the top of the document, and a full-document decode is wasted work
+    on the (common) non-challenge case.
+    """
+    try:
+        snippet = html_bytes[:4096].decode("utf-8", errors="ignore")
+        return "_cf_chl_opt" in snippet or "cdn-cgi/challenge-platform" in snippet
+    except Exception:
+        return False
 
-    Targets div.item-page (Joomla CMS content area).
-    Falls back to <main>, then <body> if div.item-page is absent.
-    Removes nav, footer, header, script, style, aside tags before extraction.
+
+def _parse_soup(soup: BeautifulSoup, url: str = "") -> str:
+    """
+    Core HTML extraction logic shared by extract_html (file-based) and
+    extract_html_bytes (Playwright-rendered bytes, no file on disk).
+
+    Targets div.item-page (Joomla CMS) or div.page-inner (PageOne CMS).
+    Falls back to <main>, <article>, then <body> if neither is present.
+    Removes nav, footer, header, script, style, aside tags before extraction,
+    but re-appends footer-inner/footer-info text separately — that block
+    carries office address/floor/phone which is otherwise lost.
     Preserves hyperlinks as markdown [text](url).
     Decodes Cloudflare email protection (data-cfemail) before extraction.
-
-    Returns plain text with normalised whitespace.
     """
-    path = Path(path)
-    if not path.exists():
-        return ""
-
-    try:
-        raw = path.read_bytes()
-        soup = BeautifulSoup(raw, "lxml")
-    except Exception:
-        return ""
-
     # Decode Cloudflare-obfuscated emails before any other processing
     _decode_cf_emails_in_soup(soup)
 
@@ -123,16 +135,45 @@ def extract_html(path: str | Path, url: str = "") -> str:
     else:
         page_title = Path(url.rstrip("/").split("/")[-1]).stem if url else ""
 
+    # Footer carries office address/floor/phone — pull it out before the
+    # generic footer removal below discards the tag entirely.
+    # Class name varies by CMS/theme across the 231 subdomains (empirically
+    # confirmed on the 6 Phase F core offices, not exhaustively surveyed):
+    #   footer-inner / footer-info-*  — dean (PageOne CMS custom footer)
+    #   jlfooterinfo-<id>             — aca (Joomla, numeric suffix per install)
+    #   footer_text / customfooter_*  — osa (underscore-style class names)
+    # Deliberately NOT "fat-footer" (cashier) — verified that class holds the
+    # site nav menu (訊息公告/關於本組/業務簡介...), not contact info; including
+    # it would inject nav noise into every cashier page's text.
+    footer_info = ""
+    footer_inner = soup.find(class_=re.compile(
+        r"^footer-inner$|^footer-info|jlfooterinfo|footer_text|customfooter", re.I
+    ))
+    if footer_inner:
+        footer_info = footer_inner.get_text(separator=" ", strip=True)
+        # dean.nccu.edu.tw's footer-inner is confirmed compromised (Black Hat SEO
+        # link injection: raw IPs + gambling-site keywords mixed into the real
+        # contact block). Bare IP literals never appear in legitimate NCCU footer
+        # text, so their presence is a reliable signal to drop the whole block
+        # rather than risk surfacing spam links in a student-facing answer.
+        if re.search(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", footer_info):
+            footer_info = ""
+
     # Remove noise elements
     for tag in soup.find_all(["nav", "footer", "header", "script", "style", "aside"]):
         tag.decompose()
 
-    # Also remove Joomla-specific navigation/breadcrumb wrappers
+    # Also remove Joomla-specific navigation/breadcrumb wrappers, but never
+    # decompose <body>/<html> themselves even if a stray class happens to match.
     for tag in soup.find_all(class_=re.compile(r"nav|menu|breadcrumb|sidebar|footer|header", re.I)):
+        if tag.name in ("body", "html"):
+            continue
         tag.decompose()
 
-    # Try Joomla content area first
+    # Try Joomla content area first, then PageOne CMS
     content = soup.find("div", class_="item-page")
+    if not content:
+        content = soup.find("div", class_="page-inner")
     if not content:
         content = soup.find("main")
     if not content:
@@ -151,7 +192,43 @@ def extract_html(path: str | Path, url: str = "") -> str:
         # Joomla placeholder or empty page — fall back to page title
         return page_title
 
+    if footer_info:
+        text = text + "\n\n" + footer_info
+
     return text
+
+
+def extract_html(path: str | Path, url: str = "") -> str:
+    """
+    Extract main content text from a downloaded HTML file on disk.
+    See _parse_soup() for the extraction logic. Returns "" if the file is
+    missing or unparseable.
+    """
+    path = Path(path)
+    if not path.exists():
+        return ""
+
+    try:
+        raw = path.read_bytes()
+        soup = BeautifulSoup(raw, "lxml")
+    except Exception:
+        return ""
+
+    return _parse_soup(soup, url)
+
+
+def extract_html_bytes(html_bytes: bytes, url: str = "") -> str:
+    """
+    Extract main content text from Playwright-rendered HTML bytes (no file
+    on disk — used for JS-rendered pages fetched via headless browser).
+    See _parse_soup() for the extraction logic.
+    """
+    try:
+        soup = BeautifulSoup(html_bytes, "lxml")
+    except Exception:
+        return ""
+
+    return _parse_soup(soup, url)
 
 
 def _extract_pdf_fitz(path: Path) -> str:
@@ -380,7 +457,7 @@ def extract_pdf(path: str | Path) -> str:
        Pages with tables → Markdown (preserves column structure for LLMs).
        Pages without tables → plain text (original behaviour).
        PyMuPDF (_extract_pdf_fitz) — large PDFs (≥50 MB); lower RAM overhead.
-    2. OCR fallback (_ocr_pdf) — if result is image-only (<100 chars) or
+    2. OCR fallback (_ocr_pdf) — if result is image-only (<10 chars) or
        cid:XX undecodable (>20% of chars are cid codes). Requires pytesseract
        + tesseract-ocr chi_tra. Returns empty string if not installed.
 
@@ -403,8 +480,10 @@ def extract_pdf(path: str | Path) -> str:
     if not text:
         return _ocr_pdf(path)  # PDF open error or empty — try OCR directly
 
-    if len(text) < 100:
-        # Image-only PDF (no text layer) — fall back to OCR
+    if len(text) < 10:
+        # Image-only PDF (no text layer) — fall back to OCR.
+        # Threshold lowered from 100→10 (commit c617b38 upstream): 100 was
+        # misclassifying short-but-real PDF content (~50 chars) as scanned.
         return _ocr_pdf(path)
 
     cid_chars = sum(len(m) for m in re.findall(r"\(cid:\d+\)", text))
@@ -476,12 +555,25 @@ if __name__ == "__main__":
         print("Extracted text:\n", result)
         sys.exit(1)
 
-    # ── Quick test: show extraction results for a few files ────────────────────
-    map_path = base / "output" / "map.json"
-    if not map_path.exists():
-        print("map.json not found")
-        sys.exit(1)
+    # ── Quick test: show extraction results from per-subdomain output/ ─────────
+    # Prefer output/<subdomain>/map.json (current structure); fall back to the
+    # old flat output/map.json for compatibility with a pre-231-subdomain checkout.
+    output_dir = base / "output"
+    map_path = None
+    if output_dir.exists():
+        for sub_map in sorted(output_dir.glob("*/map.json")):
+            map_path = sub_map
+            break
+    if map_path is None:
+        flat = base / "output" / "map.json"
+        if flat.exists():
+            map_path = flat
 
+    if not map_path:
+        print("No map.json found — run the crawler first.")
+        sys.exit(0)
+
+    print(f"Reading: {map_path}")
     records = json.loads(map_path.read_text(encoding="utf-8"))
 
     html_shown = 0
@@ -503,7 +595,7 @@ if __name__ == "__main__":
                 print(text[:400])
                 html_shown += 1
 
-        elif ftype == "pdf" and pdf_shown < 3:
+        elif ftype == "document" and pdf_shown < 3:
             text = extract_pdf(fpath)
             if text:
                 print(f"\n{'='*60}")
