@@ -5,13 +5,23 @@ Per-office contact info lookup for NCCU procedure answers.
 Resolves floor number, phone extensions, and responsible person for each
 stop in a 7-stop procedure chain.
 
-Data sources:
-  1. KNOWN_CONTACTS — Playwright-extracted staff directory (2026-05-02)
-  2. Dynamic grep → get_page for per-office member/contact pages
-  3. KNOWN_FLOORS fallback for floors absent from crawled data (moltke-verified)
+Data sources (in priority order):
+  1. office_contacts_index.jsonl — Playwright-extracted staff directory pages
+     (Phase F Step 0c, 2026-08-25), parsed dynamically by parse_office_contacts().
+     PRIMARY source — not hardcode-primary (Phase F condition 4).
+  2. KNOWN_CONTACTS — static fallback only, used when (1) finds nothing for an
+     office (missing from the index, or its page's text doesn't match either
+     parser tier). Kept intentionally small; this is what verification tests
+     against a real-but-uncovered office name to confirm graceful degradation
+     rather than a crash or blank answer.
+  3. Dynamic grep → get_page for per-office member/contact pages (existing,
+     independent of (1)/(2) — searches extracted_texts.jsonl, not the contacts index)
+  4. KNOWN_FLOORS fallback for floors absent from crawled data (moltke-verified)
 """
 
+import json
 import re
+from pathlib import Path
 
 from rag.agent_tools import grep_texts, get_page
 
@@ -31,8 +41,258 @@ KNOWN_FLOORS = {
     "圖書館":         "中正圖書館 / 達賢圖書館 / 各院分館",
 }
 
-# Staff contacts extracted via Playwright 2026-05-02.
-# Each entry: {name, ext, email, duty}. Government emails rarely change.
+
+# ── Condition 4: dynamic contacts from office_contacts_index.jsonl ──────────
+
+_CONTACTS_INDEX_PATH = Path(__file__).parent.parent.parent / "output" / "office_contacts_index.jsonl"
+
+# Maps the office names used elsewhere in this codebase (_PROCEDURE_OFFICES,
+# KNOWN_FLOORS keys) to the "name" field(s) actually present in
+# office_contacts_index.jsonl — these don't match 1:1 by substring (e.g. the
+# aca homepage's own "教務處" record is a near-empty landing page; the real
+# staff directory lives under "教務長室"/"註冊組"). Built by inspecting the
+# index directly (Phase F Step 3), not guessed.
+_OFFICE_NAME_MAP: dict[str, list[str]] = {
+    "教務處":         ["教務長室", "註冊組"],
+    "教務長":         ["教務長室"],
+    "註冊組":         ["註冊組"],
+    "生僑組":         ["生活事務暨僑生輔導組"],
+    "住宿組":         ["住宿輔導組"],
+    "出納組":         ["出納組"],
+    "國際合作事務處": ["國際合作事務處"],
+    "國合處":         ["國際合作事務處"],
+    "圖書館":         ["圖書館(各組聯絡資訊)"],
+}
+
+# Used by Tier 2 (_parse_flattened_table) to reject a "pure name line"
+# candidate that's actually a title (aca's 職稱 column, e.g. "教務長"). Kept
+# as its own set (broader than _ADMIN_TITLES below, which also includes
+# 教授-family titles _ADMIN_TITLES deliberately excludes) — over-excluding
+# here only makes Tier 2 more conservative, never worse.
+_TITLE_WORDS = {
+    "組長", "副組長", "編審", "組員", "秘書", "祕書", "主任", "館長", "教授", "副教授",
+    "助理教授", "專員", "行政專員", "一級行政專員", "一級行政組員", "兼任助理",
+    "行政組員", "職員", "教務長", "副教務長", "國合長", "院長", "主管", "館員", "一級行政",
+    "莊敬內舍生活輔導員", "莊敬九舍生活輔導員", "自強九舍生活輔導員", "自強十舍生活輔導員",
+    "資深約用心理師", "新生書院導師", "書院專案助理", "專案行政專員", "定期約用人員",
+    "計畫專任助理", "住宿組組長", "約用心理師", "約用社工師", "約用社工員", "約用護理師",
+    "約用職代", "專任助理", "中心主任", "職涯總監", "中心秘書", "中心組長", "輔導員",
+    "護理師", "一級技術師", "工程師", "技術師", "技士",
+}
+
+# Tier 1: explicitly-labeled fields ("分機"/"校內分機" immediately before the
+# extension) — covers osa's per-person div-card pages and cashier's
+# PageStaffing format. Negative lookaround excludes "職務代理人：王小明（分機：
+# 62221）"-style deputy REFERENCES embedded in someone else's own entry —
+# without it, the deputy mention (which appears earlier in the text) wins the
+# de-dup race against that person's own real, fuller entry.
+_EXT_LABELED_RE  = re.compile(r'(?<!（)(?:校內)?分機\s*[：:]?\s*\n*\s*(\d{4,5})(?!\s*）)')
+_NAME_LABELED_RE  = re.compile(r'姓\s*名\s*\n*\s*([一-鿿]{2,6})')
+_TITLE_LABELED_RE = re.compile(r'職\s*稱\s*\n*\s*([^\n]{2,20})')
+_EMAIL_RE         = re.compile(r'([\w.+-]+@nccu\.edu\.tw)')
+
+# When no "姓名" label exists (e.g. cashier's "劉桂芬 組長" run-on format),
+# only trust a name immediately adjacent to a KNOWN administrative title —
+# NOT a bare "last 2-4 hanzi before the extension" guess. That looser
+# version fabricated names from institutional/duty prose on oic's page
+# (e.g. "...研究所教授" → wrongly extracted "斯研究所" as a person's name,
+# since oic's bios end in a title-like word with no real name label or
+# adjacency anywhere nearby).
+#
+# _ADMIN_TITLES is empirically harvested (Phase F Step 3, 2026-08-25), not
+# manually enumerated from the 6 offices we happened to test — a hand-built
+# list would only ever cover titles we'd already seen, which is exactly the
+# overfitting risk for the other 138 subdomains in office_contacts_index.jsonl
+# nobody has read. Harvest method: scan every record where BOTH "職稱" and
+# "姓名" labels are present (Tier 1's own high-confidence signal), and take
+# the 職稱 value of every block that also has a 姓名 nearby — i.e. let the
+# labeled format teach the unlabeled-format parser its own title vocabulary,
+# corpus-wide. This is what actually generalizes past our 6 test offices.
+# Deliberately excludes 教授/副教授/助理教授 (oic's false-positive cause,
+# and they never got harvested anyway — no page pairs a professor title with
+# a 姓名 label) plus a few that never appeared: 工程師/一級技術師/技術師 are
+# added by hand from a page (圖書館系統資訊組) confirmed by direct manual
+# read, since the harvest can only find titles that occur SOMEWHERE in
+# labeled form. The same blind spot bit "編審"/"兼任助理"/"副組長" here too —
+# those never got harvested despite being real, previously-verified titles on
+# cashier's page (also unlabeled, same structural reason 工程師 was missed) —
+# caught only by re-running the 6-office regression check after switching to
+# the harvested list, which is exactly why that check exists. So this is the
+# UNION of the corpus-wide harvest with every title manually confirmed on the
+# specific unlabeled pages read directly (cashier, 圖書館系統資訊組) — not a
+# straight replacement of the hand-curated list, which would have silently
+# dropped real titles the harvest structurally can't see.
+_ADMIN_TITLES = sorted([
+    # harvested corpus-wide from labeled-format pages
+    "莊敬內舍生活輔導員", "莊敬九舍生活輔導員", "自強九舍生活輔導員", "自強十舍生活輔導員",
+    "資深約用心理師", "一級行政專員", "一級行政組員", "新生書院導師", "書院專案助理",
+    "專案行政專員", "定期約用人員", "計畫專任助理", "住宿組組長", "約用心理師",
+    "約用社工師", "約用社工員", "約用護理師", "行政專員", "約用職代", "專任助理",
+    "行政組員", "中心主任", "職涯總監", "中心秘書", "中心組長", "輔導員", "護理師",
+    "組長", "組員", "技士", "專員", "主任",
+    # manually confirmed on unlabeled-format pages the harvest can't reach
+    "編審", "副組長", "兼任助理", "秘書", "祕書", "館長", "副館長", "館員",
+    "一級技術師", "工程師", "技術師",
+], key=len, reverse=True)
+_NAME_TITLE_RE = re.compile(rf'([一-鿿]{{2,4}})\s*(?:{"|".join(_ADMIN_TITLES)})')
+
+# Tier 2: flattened HTML tables (Joomla "人員職掌" pages, e.g. aca's 教務長室/
+# 註冊組/課務組/綜合業務組) — the table header ("職稱/姓名/業務項目/分機/職務
+# 代理人") appears once; per-row values then run together with no per-field
+# labels. The one reliable anchor is each row's OWN extension: a bare 4-5
+# digit number NOT wrapped in parens (deputy extensions ARE parenthesized,
+# e.g. "(62846)", which is exactly how this format writes the same
+# 職務代理人 references Tier 1 has to exclude a different way).
+_PURE_NAME_LINE_RE = re.compile(r'^\s*\[?([一-鿿]{2,4})\]?(?:\(https?://[^)]*\))?\s*$')
+_EXT_BARE_RE        = re.compile(r'(?<!\()(?<!\d)(\d{5})(?!\d)(?!\))')
+
+
+def _parse_labeled(text: str) -> list[dict]:
+    ext_matches = list(_EXT_LABELED_RE.finditer(text))
+    contacts: list[dict] = []
+    seen: set[str] = set()
+    for i, m in enumerate(ext_matches):
+        ext = m.group(1)
+        if ext in seen:
+            continue
+        block_start = ext_matches[i - 1].end() if i > 0 else max(0, m.start() - 300)
+        block = text[block_start:m.start()].rstrip()
+        name_match = _NAME_LABELED_RE.search(block)
+        if name_match:
+            name = name_match.group(1)
+        else:
+            # Search the WHOLE block, not just its tail — the name+title pair
+            # sits right before the extension in cashier's format ("...代理人
+            # \n\n{name} {title}\n\n校內分機") but right at the block's START
+            # in another format (圖書館系統資訊組: "{name} {title}\n\n{long
+            # duty paragraph}\n\n分機：{ext}"). Take the FIRST match in the
+            # block, since block boundaries are already per-person (start at
+            # the previous person's extension), so the first name+title pair
+            # found belongs to this block's own owner.
+            nt_match = _NAME_TITLE_RE.search(block)
+            name = nt_match.group(1) if nt_match else ""
+        if not name:
+            continue
+        seen.add(ext)
+        title_match = _TITLE_LABELED_RE.search(block)
+        duty = title_match.group(1).strip() if title_match else ""
+        block_end = ext_matches[i + 1].start() if i + 1 < len(ext_matches) else m.end() + 200
+        email_match = _EMAIL_RE.search(text[m.end():block_end])
+        contacts.append({
+            "name": name, "ext": ext,
+            "email": email_match.group(1) if email_match else None,
+            "duty": duty,
+        })
+    return contacts
+
+
+def _parse_flattened_table(text: str) -> list[dict]:
+    matches = list(_EXT_BARE_RE.finditer(text))
+    contacts: list[dict] = []
+    seen: set[str] = set()
+    prev_end = 0
+    for m in matches:
+        ext = m.group(1)
+        block = text[prev_end:m.start()]
+        prev_end = m.end()
+        if ext in seen:
+            continue
+        name = ""
+        for line in (l.strip() for l in block.split("\n") if l.strip()):
+            pm = _PURE_NAME_LINE_RE.match(line)
+            if pm and pm.group(1) not in _TITLE_WORDS:
+                name = pm.group(1)  # last pure-name line before the ext wins
+        if not name:
+            continue
+        seen.add(ext)
+        email_match = _EMAIL_RE.search(text[m.end():m.end() + 150])
+        contacts.append({
+            "name": name, "ext": ext,
+            "email": email_match.group(1) if email_match else None,
+            "duty": "",
+        })
+    return contacts
+
+
+def parse_office_contacts(text: str) -> list[dict]:
+    """
+    Extract [{name, ext, email, duty}, ...] from one office_contacts_index.jsonl
+    record's raw text. Tries the labeled-field parser first (works for most
+    CMS layouts observed); falls back to the flattened-table parser only when
+    BOTH the labeled parser found nothing AND "分機" appears just a handful of
+    times in the whole page (<=3) — the fingerprint of a genuine flattened
+    table, where the column header ("職稱/姓名/業務項目/分機/..." on aca's
+    pages, "館名/單位/...校內分機/..." on the library's) appears exactly
+    once and per-row values are bare, unlabeled numbers. A page where "分機"
+    appears many times (oic: 36) means every person already has their OWN
+    labeled "分機：" — tier 1 correctly tried all of them and correctly found
+    no reliable name for any (oic's bios end in institutional phrases with no
+    name nearby), and falling back to the flattened-table guess there
+    misfired on oic's own short standalone duty-list lines (e.g. "校務評鑑",
+    "總務庶務") which happen to also match that parser's "short pure-hanzi
+    line" heuristic — producing confident-looking garbage names for a page
+    where no name is reliably in the text at all. Not a claim of 100%
+    precision on every subdomain's CMS quirks — good enough to identify the
+    right office and a plausible contact for it, which is the bar Phase F
+    set for this (see Step 0c contact.csv discussion); an office this can't
+    parse falls all the way back to KNOWN_CONTACTS via
+    dynamic_contacts_for_office(), not to a guess.
+    """
+    contacts = _parse_labeled(text)
+    if not contacts and text.count("分機") <= 3:
+        contacts = _parse_flattened_table(text)
+    return contacts
+
+
+_contacts_index_cache: dict[str, list[dict]] | None = None  # name -> raw text, loaded once
+
+
+def _load_contacts_index() -> dict[str, list[dict]]:
+    global _contacts_index_cache
+    if _contacts_index_cache is not None:
+        return _contacts_index_cache
+
+    by_name: dict[str, list[dict]] = {}
+    if _CONTACTS_INDEX_PATH.exists():
+        with _CONTACTS_INDEX_PATH.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                by_name.setdefault(rec.get("name", ""), []).append(rec)
+    _contacts_index_cache = by_name
+    return by_name
+
+
+def dynamic_contacts_for_office(office: str) -> list[dict]:
+    """
+    Primary contact lookup for `office` (Phase F condition 4) — queries
+    office_contacts_index.jsonl via _OFFICE_NAME_MAP, parses each matching
+    record's raw text, and merges results (deduped by extension). Returns []
+    if the office isn't in _OFFICE_NAME_MAP or none of its mapped records
+    parse to anything — caller falls back to KNOWN_CONTACTS in that case.
+    """
+    index = _load_contacts_index()
+    record_names = _OFFICE_NAME_MAP.get(office, [])
+
+    contacts: list[dict] = []
+    seen_exts: set[str] = set()
+    for record_name in record_names:
+        for rec in index.get(record_name, []):
+            for c in parse_office_contacts(rec.get("text", "")):
+                if c["ext"] in seen_exts:
+                    continue
+                seen_exts.add(c["ext"])
+                contacts.append(c)
+    return contacts
+
+
+# Static fallback only — used when dynamic_contacts_for_office() finds nothing
+# for an office (not in _OFFICE_NAME_MAP, or its page failed to parse). Kept
+# intentionally small. Extracted via Playwright 2026-05-02; 教務長 corrected
+# 2026-08-25 (林啓屏 → 劉吉軒, confirmed via office_contacts_index.jsonl —
+# 林啓屏 is now 副校長, not 教務長). Each entry: {name, ext, email, duty}.
 KNOWN_CONTACTS: dict[str, list[dict]] = {
     "生僑組": [
         {"name": "盧誼甄", "ext": "62226", "email": "karena@nccu.edu.tw",    "duty": "休退學退費"},
@@ -63,13 +323,13 @@ KNOWN_CONTACTS: dict[str, list[dict]] = {
         {"name": "國合處", "ext": "62040", "email": "oic@nccu.edu.tw",       "duty": "國際學生業務"},
     ],
     "教務處": [
-        {"name": "林啓屏", "ext": "62160", "email": None,                    "duty": "教務長"},
+        {"name": "劉吉軒", "ext": "62160", "email": None,                    "duty": "教務長"},
         {"name": "曹惠莉", "ext": "62163", "email": None,                    "duty": "秘書（教務長室）"},
         {"name": "黃婉綝", "ext": "63281", "email": "tr63279@nccu.edu.tw",   "duty": "學士班學籍統籌（註冊組）"},
         {"name": "王揚忠", "ext": "63273", "email": None,                    "duty": "註冊組組長"},
     ],
     "教務長": [
-        {"name": "林啓屏", "ext": "62160", "email": None,                    "duty": "教務長"},
+        {"name": "劉吉軒", "ext": "62160", "email": None,                    "duty": "教務長"},
         {"name": "曹惠莉", "ext": "62163", "email": None,                    "duty": "秘書"},
     ],
     "註冊組": [
@@ -176,11 +436,14 @@ class OfficeLookupSkill:
     def run(self, offices: list[str]) -> dict[str, dict]:
         result = {}
         for office in offices:
+            # Condition 4: dynamic lookup is primary; KNOWN_CONTACTS is the
+            # fallback only when the dynamic index has nothing for this office.
+            contacts = dynamic_contacts_for_office(office) or KNOWN_CONTACTS.get(office, [])
             entry: dict = {
                 "office":    office,
                 "floor":     KNOWN_FLOORS.get(office),
                 "phones":    [],
-                "contacts":  KNOWN_CONTACTS.get(office, []),
+                "contacts":  contacts,
                 "page_url":  None,
                 "note":      "",
             }
