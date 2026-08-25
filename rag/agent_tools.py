@@ -39,19 +39,20 @@ def grep_texts(
     max_results: int = 5
 ) -> list[dict]:
     """
-    Full-text search across extracted_texts.jsonl files.
+    Full-text search across extracted_*.jsonl files (extracted_texts.jsonl +
+    extracted_supplementary.jsonl, where present).
     subdomain: restrict to one subdomain (e.g. "aca", "cashier")
     group: restrict to a named group defined in SUBDOMAIN_GROUPS
            (e.g. "nccuga" searches all 10 general-affairs subdomains)
     Returns [{url, title, preview, subdomain}, ...]
     """
     if subdomain:
-        paths = [f"{CRAWLER_OUTPUT}/{subdomain}/extracted_texts.jsonl"]
+        paths = glob.glob(f"{CRAWLER_OUTPUT}/{subdomain}/extracted_*.jsonl")
     elif group:
         subdomains = SUBDOMAIN_GROUPS.get(group, [])
-        paths = [f"{CRAWLER_OUTPUT}/{s}/extracted_texts.jsonl" for s in subdomains]
+        paths = [p for s in subdomains for p in glob.glob(f"{CRAWLER_OUTPUT}/{s}/extracted_*.jsonl")]
     else:
-        paths = glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_texts.jsonl")
+        paths = glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl")
 
     results = []
     for path in paths:
@@ -93,7 +94,7 @@ def get_page(url: str) -> dict:
     """
     decoded = urllib.parse.unquote(url)
 
-    for path in glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_texts.jsonl"):
+    for path in glob.glob(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl"):
         if not Path(path).exists():
             continue
         try:
