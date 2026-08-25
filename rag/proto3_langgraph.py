@@ -3,14 +3,17 @@ rag/proto3_langgraph.py
 Prototype 3: LangGraph-based agentic RAG pipeline.
 
 Graph:
-  START → router_node ──(PROCEDURE/KNOWLEDGE)──▶ retrieval_node ──▶ office_lookup_node
-                      ╰──(CONTACT)─────────────────────────────────▶ office_lookup_node
-                                                                             │
-                                                                     synthesis_node ◀─╮
-                                                                             │         │ correction_hint set
-                                                                     self_eval_node ──╯ (max 2 retries)
-                                                                             │
-                                                                            END
+  START → query_decomposition_node ──(not composite)──▶ router_node ──(PROCEDURE/KNOWLEDGE)──▶ retrieval_node ──▶ office_lookup_node
+                                  │                                 ╰──(CONTACT)─────────────────────────────────▶ office_lookup_node
+                                  │                                                                                        │
+                                  │                                                                                extraction_node
+                                  ╰──(composite)──▶ merge_node (v1: sequential loop over sub_queries — TODO: Send) ────────╯
+                                                                                                                             │
+                                                                                                                     synthesis_node ◀─╮
+                                                                                                                             │         │ correction_hint set
+                                                                                                                     self_eval_node ──╯ (max 2 retries)
+                                                                                                                             │
+                                                                                                                            END
 
 Run:
     python -m rag.proto3_langgraph "如何辦理休學"
@@ -28,7 +31,7 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from rag.router import route, QueryType
+from rag.router import route, QueryType, _keyword_route
 from rag.llm_client import chat_with_tools, simple_chat, get_active_model, PROVIDER
 from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form, extract_form_ids
 from rag.skills.procedure_skill import ProcedureSkill
@@ -41,6 +44,7 @@ class AgentState(TypedDict):
     query:                str
     query_type:           str        # "procedure" / "contact" / "knowledge"
     route_method:         str        # "keyword" / "llm" / "default"
+    sub_queries:          list[str]  # Step 2.5: non-empty only for composite queries
     context_pages:        list[dict] # retrieved pages (PROCEDURE / KNOWLEDGE)
     office_context:       str        # formatted contact info — E3: OfficeLookupSkill
     extraction_checklist: dict       # condition 6: pre-synthesis dynamic checklist
@@ -176,6 +180,117 @@ def _dispatch(name: str, args: dict):
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
+
+# Split on 逗號/句號 (full-width and half-width) — clause boundaries are the
+# unit query_decomposition_node reasons about.
+_CLAUSE_SPLIT_RE = re.compile(r'[，。,.]')
+
+
+def query_decomposition_node(state: AgentState) -> AgentState:
+    """
+    Step 2.5: detect composite queries (multiple distinct topics in one
+    question) BEFORE routing, so they don't get silently collapsed to a
+    single QueryType by router_node's single-label classification (confirmed
+    in Step 1 Q6: "如何辦理休學，圖書館的電話是多少" degraded the 休學 half
+    when both topics were forced through one router_node/synthesis_node pass).
+
+    v1 detection is pure Layer-1 keyword matching, reusing router.py's
+    existing _keyword_route() per clause — no LLM call. This mirrors
+    router.py's own "keyword first, LLM only when ambiguous" principle at
+    the decomposition level: a clause with no clear keyword signal doesn't
+    force an LLM call just to decide whether the query is composite.
+
+    A query is composite only if 2+ clauses resolve to DIFFERENT QueryTypes
+    via _keyword_route(). A single-topic query that merely has a pause
+    (e.g. "休學需要注意哪些事，包含要去哪些辦公室" — both clauses are
+    QueryType.PROCEDURE or ambiguous) is NOT composite; sub_queries stays
+    empty and the query proceeds through the normal single-query path.
+    """
+    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(state["query"]) if c.strip()]
+    if len(clauses) < 2:
+        return {**state, "sub_queries": []}
+
+    types_found = {t for t in (_keyword_route(c) for c in clauses) if t is not None}
+    if len(types_found) < 2:
+        return {**state, "sub_queries": []}  # not composite — 0 or 1 distinct type
+
+    return {**state, "sub_queries": clauses}
+
+
+def merge_node(state: AgentState) -> AgentState:
+    """
+    Step 2.5: process each sub_query and merge results at the DATA layer
+    only (context_pages / office_context / extraction_checklist) — never
+    merges generated text, to avoid fragmented answers and multiplying LLM
+    calls. One synthesis_node call handles the merged data for the whole
+    composite query, same as a single query would.
+
+    v1 is a plain sequential loop (established TODO, do not let this quietly
+    become permanent): upgrade to Send-based parallel dispatch by replacing
+    just this for-loop — the merge logic below already operates on
+    independent per-sub-query results, so it is unaffected by whether the
+    loop runs sequentially or via Send.
+
+    Reuses retrieval_node / office_lookup_node / extraction_node as plain
+    function calls against an isolated per-sub-query state (not through
+    graph routing) — same node functions the single-query path uses,
+    not reimplemented. retrieval_node is skipped for CONTACT sub-queries,
+    matching _after_router's routing behaviour (retrieval_node's KNOWLEDGE
+    branch would otherwise run for CONTACT, which it was never designed for).
+    """
+    merged_context_pages: list[dict] = []
+    merged_sources: list[str] = []
+    office_sections: list[str] = []
+    merged_person_names: list[dict] = []
+    merged_forms: list[dict] = []
+    seen_form_ids: set[str] = set()
+
+    for sub_query in state["sub_queries"]:
+        result = route(sub_query)
+        sub_state: AgentState = {
+            **state,
+            "query":                sub_query,
+            "query_type":           result.query_type.value,
+            "route_method":         result.method,
+            "context_pages":        [],
+            "office_context":       "",
+            "extraction_checklist": {},
+            "sources":              [],
+        }
+
+        if result.query_type in (QueryType.PROCEDURE, QueryType.KNOWLEDGE):
+            sub_state = retrieval_node(sub_state)
+
+        sub_state = office_lookup_node(sub_state)
+        sub_state = extraction_node(sub_state)
+
+        merged_context_pages.extend(sub_state.get("context_pages", []))
+        merged_sources.extend(sub_state.get("sources", []))
+        if sub_state.get("office_context"):
+            office_sections.append(sub_state["office_context"])
+
+        checklist = sub_state.get("extraction_checklist", {})
+        merged_person_names.extend(checklist.get("person_names", []))
+        for f in checklist.get("forms", []):
+            if f["id"] not in seen_form_ids:
+                seen_form_ids.add(f["id"])
+                merged_forms.append(f)
+
+    return {
+        **state,
+        "context_pages":        merged_context_pages,
+        "sources":              list(dict.fromkeys(merged_sources)),
+        "office_context":       "\n\n".join(office_sections),
+        "extraction_checklist": {"person_names": merged_person_names, "forms": merged_forms},
+        # Composite answers always go through the full prompt-based synthesis
+        # (office_section + checklist), never the KNOWLEDGE pass-through —
+        # needed to weave multiple sub-topics into one coherent answer even
+        # when every sub_query happened to be KNOWLEDGE-type. Also keeps
+        # self_eval_node's retry loop active (PROCEDURE-only gate), valuable
+        # here since composite answers are the highest-complexity case.
+        "query_type":            QueryType.PROCEDURE.value,
+    }
+
 
 def router_node(state: AgentState) -> AgentState:
     """Classify the query into PROCEDURE / CONTACT / KNOWLEDGE."""
@@ -537,6 +652,12 @@ def self_eval_node(state: AgentState) -> AgentState:
 
 # ── Conditional routing ───────────────────────────────────────────────────────
 
+def _after_decomposition(state: AgentState) -> str:
+    if state.get("sub_queries"):
+        return "merge_node"
+    return "router_node"
+
+
 def _after_router(state: AgentState) -> str:
     if state["query_type"] == QueryType.CONTACT:
         return "office_lookup_node"
@@ -600,6 +721,8 @@ def _parametric_fallback(query: str) -> str:
 def build_graph():
     g = StateGraph(AgentState)
 
+    g.add_node("query_decomposition_node", query_decomposition_node)
+    g.add_node("merge_node",         merge_node)
     g.add_node("router_node",        router_node)
     g.add_node("retrieval_node",     retrieval_node)
     g.add_node("office_lookup_node", office_lookup_node)
@@ -607,7 +730,9 @@ def build_graph():
     g.add_node("synthesis_node",     synthesis_node)
     g.add_node("self_eval_node",     self_eval_node)
 
-    g.add_edge(START, "router_node")
+    g.add_edge(START, "query_decomposition_node")
+    g.add_conditional_edges("query_decomposition_node", _after_decomposition)
+    g.add_edge("merge_node",         "synthesis_node")
     g.add_conditional_edges("router_node",    _after_router)
     g.add_edge("retrieval_node",     "office_lookup_node")
     g.add_edge("office_lookup_node", "extraction_node")
@@ -630,6 +755,7 @@ def run(query: str) -> str:
         "query":                query,
         "query_type":           "",
         "route_method":         "",
+        "sub_queries":          [],
         "context_pages":        [],
         "office_context":       "",
         "extraction_checklist": {},
