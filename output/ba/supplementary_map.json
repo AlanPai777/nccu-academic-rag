@@ -1,0 +1,36 @@
+[
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-T01-02-05",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-19T21:51:42.303338",
+    "category": "admin_academic",
+    "saved_path": "output/ba/supplementary/moltke_QP-T01-02-05.pdf",
+    "child_count": 0,
+    "file_size": 170927,
+    "form_id": "QP-T01-02-05",
+    "form_title": "各項證明文件申辦委託書 / Power of Attorney for Certificates",
+    "form_description": "委託他人代辦事項時，代辦人需附本委託書。",
+    "form_unit": "教務處註冊組",
+    "form_keywords": "註冊組　\n                    代辦"
+  },
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-T01-04-03",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-19T21:51:57.010122",
+    "category": "admin_academic",
+    "saved_path": "output/ba/supplementary/moltke_QP-T01-04-03.pdf",
+    "child_count": 0,
+    "file_size": 129605,
+    "form_id": "QP-T01-04-03",
+    "form_title": "替代學分申請書 / Application Form for Substitution of Credits",
+    "form_description": "原必修科目因故未修，申請以其它科目替代用。",
+    "form_unit": "教務處註冊組",
+    "form_keywords": "註冊組　\n                    必修科目"
+  }
+]

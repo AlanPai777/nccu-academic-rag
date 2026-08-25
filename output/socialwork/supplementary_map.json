@@ -1,0 +1,53 @@
+[
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-T01-05-02",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-24T11:56:24.334424",
+    "category": "admin_academic",
+    "saved_path": "output/socialwork/supplementary/moltke_QP-T01-05-02.pdf",
+    "child_count": 0,
+    "file_size": 148803,
+    "form_id": "QP-T01-05-02",
+    "form_title": "碩博士班學位考試成績報告單 / Degree Examination Result Report for Master's and Doctoral Degree Candidates",
+    "form_description": "碩博士班學位考試成績報告單\nDegree Examination Result Report for Master's and Doctoral Degree Candidates 202511",
+    "form_unit": "教務處註冊組",
+    "form_keywords": "註冊組　\n                    碩士碩班博班　\n                    口試"
+  },
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-T01-05-03",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-24T11:56:25.594750",
+    "category": "admin_academic",
+    "saved_path": "output/socialwork/supplementary/moltke_QP-T01-05-03.pdf",
+    "child_count": 0,
+    "file_size": 181374,
+    "form_id": "QP-T01-05-03",
+    "form_title": "碩博士班變更指導教授及論文題目申請書 /  Application Form for Changing Master's and Doctoral Advisors and Thesis Titles",
+    "form_description": "碩博士班變更指導教授、論文題目時使用。",
+    "form_unit": "教務處註冊組",
+    "form_keywords": "註冊組　\n                    碩士碩班博班　\n                    老師更換論文指導"
+  },
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-T01-05-11",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-24T11:56:26.837428",
+    "category": "admin_academic",
+    "saved_path": "output/socialwork/supplementary/moltke_QP-T01-05-11.pdf",
+    "child_count": 0,
+    "file_size": 276374,
+    "form_id": "QP-T01-05-11",
+    "form_title": "國立政治大學碩博士學生電子論文學術品質同意書 /  Graduate Students Electronic Thesis Academic Quality Consent Form",
+    "form_description": "碩博士學生電子論文學術品質同意書",
+    "form_unit": "教務處註冊組",
+    "form_keywords": "論文　\n                    學術　\n                    碩博"
+  }
+]

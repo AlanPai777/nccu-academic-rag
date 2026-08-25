@@ -1,0 +1,86 @@
+[
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1092/schmPrv.jsp-yy=109&smt=2&num=045028&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:56:56.775420",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=109&smt=2&num=045028&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 83537
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1092/schmPrv.jsp-yy=109&smt=2&num=045030&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:56:57.370171",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=109&smt=2&num=045030&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 73156
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1101/schmPrv.jsp-yy=110&smt=1&num=043042&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:56:57.907992",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=110&smt=1&num=043042&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 38300
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1101/schmPrv.jsp-yy=110&smt=1&num=045034&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:56:58.515132",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=110&smt=1&num=045034&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 73805
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1102/schmPrv.jsp-yy=110&smt=2&num=045037&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:56:59.200314",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=110&smt=2&num=045037&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 63860
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1102/schmPrv.jsp-yy=110&smt=2&num=045038&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:56:59.859791",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=110&smt=2&num=045038&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 100127
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1102/schmPrv.jsp-yy=110&smt=2&num=045039&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T13:57:00.533667",
+    "category": "admin_academic",
+    "saved_path": "output/topu/supplementary/newdoc_schmPrv.jsp-yy=110&smt=2&num=045039&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 68691
+  }
+]

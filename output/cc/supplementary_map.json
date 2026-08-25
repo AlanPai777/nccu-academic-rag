@@ -1,0 +1,48 @@
+[
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-C04-01-04",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-21T15:59:18.519886",
+    "category": "admin_academic",
+    "saved_path": "output/cc/supplementary/moltke_QP-C04-01-04.pdf",
+    "child_count": 0,
+    "file_size": 100292,
+    "form_id": "QP-C04-01-04",
+    "form_title": "公用電子郵件密碼變更申請表",
+    "form_description": "一、 申請方式：\n1. 申請人直接持本表及教職員證至電算中心一樓服務台辦理。\n2. 以校內公文交換方式傳遞至「電算中心網路組」申請辦理。\n二、 變更密碼之核發：\n變更完成後，密碼一律以電子郵件方式寄給申請人。",
+    "form_unit": "電算網路組",
+    "form_keywords": "公用　\n                    電子郵件　\n                    密碼變更"
+  },
+  {
+    "url": "https://moltke.nccu.edu.tw/formservice_SSO/link.jsp?viewdetail=QP-C04-03-07",
+    "depth": 1,
+    "parent": "https://moltke.nccu.edu.tw/formservice_SSO/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-21T15:59:20.376734",
+    "category": "admin_academic",
+    "saved_path": "output/cc/supplementary/moltke_QP-C04-03-07.pdf",
+    "child_count": 0,
+    "file_size": 106347,
+    "form_id": "QP-C04-03-07",
+    "form_title": "防火牆進出規則申請表",
+    "form_description": "防火牆進出規則申請表",
+    "form_unit": "電算網路組",
+    "form_keywords": "防火牆　\n                    進出"
+  },
+  {
+    "url": "http://newdoc.nccu.edu.tw/formservice/1178/1178_2197.pdf",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "document",
+    "fetched_at": "2026-08-21T15:59:23.609204",
+    "category": "admin_academic",
+    "saved_path": "output/cc/supplementary/newdoc_1178_2197.pdf",
+    "child_count": 0,
+    "file_size": 55772
+  }
+]

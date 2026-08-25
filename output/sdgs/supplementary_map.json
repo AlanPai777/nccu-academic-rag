@@ -1,0 +1,62 @@
+[
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1142/schmPrv.jsp-yy=114&smt=2&num=070444&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T11:53:05.205453",
+    "category": "admin_academic",
+    "saved_path": "output/sdgs/supplementary/newdoc_schmPrv.jsp-yy=114&smt=2&num=070444&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 96821
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1142/schmPrv.jsp-yy=114&smt=2&num=090128&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T11:53:05.900700",
+    "category": "admin_academic",
+    "saved_path": "output/sdgs/supplementary/newdoc_schmPrv.jsp-yy=114&smt=2&num=090128&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 66074
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1142/schmPrv.jsp-yy=114&smt=2&num=206786&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T11:53:06.427631",
+    "category": "admin_academic",
+    "saved_path": "output/sdgs/supplementary/newdoc_schmPrv.jsp-yy=114&smt=2&num=206786&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 85765
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1142/schmPrv.jsp-yy=114&smt=2&num=261876&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T11:53:06.947819",
+    "category": "admin_academic",
+    "saved_path": "output/sdgs/supplementary/newdoc_schmPrv.jsp-yy=114&smt=2&num=261876&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 76603
+  },
+  {
+    "url": "https://newdoc.nccu.edu.tw/teaschm/1142/schmPrv.jsp-yy=114&smt=2&num=601364&gop=00&s=1.html",
+    "depth": 1,
+    "parent": "https://newdoc.nccu.edu.tw/",
+    "status": "ok",
+    "type": "html",
+    "fetched_at": "2026-08-24T11:53:07.620791",
+    "category": "admin_academic",
+    "saved_path": "output/sdgs/supplementary/newdoc_schmPrv.jsp-yy=114&smt=2&num=601364&gop=00&s=1.html",
+    "child_count": 0,
+    "file_size": 50707
+  }
+]
