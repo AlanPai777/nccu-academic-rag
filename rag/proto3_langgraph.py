@@ -82,7 +82,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name":        "grep_texts",
-            "description": "在 NCCU 文件庫全文搜尋，回傳相關頁面列表（含預覽文字）",
+            "description": "還不知道確切 URL、只有關鍵字時的第一步：全文搜尋回傳相關頁面列表（含預覽文字）。已經有明確 URL 時不要再呼叫這個工具，改用 get_page 直接取頁面。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -98,7 +98,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name":        "get_page",
-            "description": "取得指定 URL 的完整頁面內文（整頁，不分段）",
+            "description": "取得指定 URL 的完整頁面內文（整頁，不分段）。只在已有明確 URL（來自 grep_texts 或 extract_links 的結果）時呼叫，不要對猜測、拼湊出來的 URL 呼叫。",
             "parameters": {
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
@@ -110,7 +110,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name":        "extract_links",
-            "description": "提取某頁面中所有指向 NCCU 子網域的 markdown 連結",
+            "description": "抓出目前頁面正文明確提到的、指向其他 NCCU 子網域的 markdown 連結——只在目前頁面沒有直接答案、但內容提到其他相關頁面（如跨處室蓋章流程）時才用。內容已經足以回答問題就不用呼叫。跟 get_children 不同：這裡只看正文明確提到的連結，範圍窄但精準。",
             "parameters": {
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
@@ -122,7 +122,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name":        "get_children",
-            "description": "取得某 URL 在 BFS 爬蟲中的所有直屬子頁面",
+            "description": "取得某 URL 在爬蟲階層下的所有直屬子頁面，範圍是整個爬蟲結構、不限於正文提到的連結。跟 extract_links 的差異：extract_links 只抓正文明確提到的連結（精準但窄），get_children 抓爬蟲階層下全部子頁（廣但較模糊）——先試 extract_links，找不到答案再考慮這個。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -137,7 +137,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name":        "get_form",
-            "description": "取得官方 moltke 表單的完整內容（申辦流程、各單位地點）",
+            "description": "取得官方 moltke 表單的完整內容（申辦流程、各單位地點）。只在問題明確需要官方表單本身（如表單編號、下載/填寫細節）時使用；一般性流程說明用 get_page/grep_texts 通常就夠，不需要額外呼叫這個工具。",
             "parameters": {
                 "type": "object",
                 "properties": {"form_id": {"type": "string"}},
