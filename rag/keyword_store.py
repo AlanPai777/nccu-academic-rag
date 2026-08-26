@@ -67,21 +67,36 @@ class KeywordStore:
         finally:
             conn.close()
 
-    def build_index(self, chunks_path: Path | str = CHUNKS_PATH,
+    def build_index(self, chunks_path: Path | str | list[Path | str] = CHUNKS_PATH,
                     force: bool = False) -> int:
-        """Build FTS5 index from chunks.jsonl.
+        """Build FTS5 index from one or more JSONL files.
 
         Args:
-            chunks_path: Path to chunks.jsonl
+            chunks_path: Path to chunks.jsonl (classic RAG, chunked records),
+                         OR a list of paths — e.g. glob.glob("output/*/extracted_texts.jsonl")
+                         for proto3's whole-page records (Phase F Step 4.7).
+                         Field mapping degrades gracefully for whichever
+                         schema is present (chunk_index/chunk_len/chunk_type/
+                         fetched_at all default when absent, as extracted_texts.jsonl's do).
+                         Subdomain is inferred per-file from its parent directory
+                         name (output/<subdomain>/extracted_texts.jsonl) when the
+                         record itself has no "subdomain" field — needed for
+                         Domain Router's Layer 2 per-subdomain aggregation.
             force: If True, drop and rebuild even if index exists
 
         Returns:
-            Number of chunks indexed.
+            Number of records indexed.
         """
-        chunks_path = Path(chunks_path)
-        if not chunks_path.exists():
-            print(f"ERROR: {chunks_path} not found. Run build_chunks.py first.")
+        paths = [chunks_path] if isinstance(chunks_path, (str, Path)) else list(chunks_path)
+        paths = [Path(p) for p in paths]
+        existing_paths = [p for p in paths if p.exists()]
+        if not existing_paths:
+            print(f"ERROR: none of {len(paths)} input path(s) exist. Run build_chunks.py "
+                  f"(or preprocess_all.py for extracted_texts.jsonl) first.")
             sys.exit(1)
+        if len(existing_paths) < len(paths):
+            print(f"WARNING: {len(paths) - len(existing_paths)} of {len(paths)} "
+                  f"input path(s) not found — indexing the remaining {len(existing_paths)}.")
 
         conn = self._conn()
         try:
@@ -95,6 +110,7 @@ class KeywordStore:
                     rowid INTEGER PRIMARY KEY AUTOINCREMENT,
                     url TEXT NOT NULL,
                     title TEXT,
+                    subdomain TEXT,
                     depth INTEGER DEFAULT 0,
                     source_type TEXT,
                     category TEXT,
@@ -124,49 +140,62 @@ class KeywordStore:
             conn.execute("DELETE FROM chunks_fts")
 
             total = 0
-            with open(chunks_path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    chunk = json.loads(line)
-                    text_clean = chunk.get("text_clean", chunk.get("text", ""))
+            for path in existing_paths:
+                # output/<subdomain>/extracted_texts.jsonl -> "<subdomain>"; for a
+                # flat file like rag/chunks.jsonl this just yields its parent dir
+                # name and is ignored below since those records carry no real
+                # per-record subdomain concept.
+                path_subdomain = path.parent.name
 
-                    # Insert metadata
-                    conn.execute("""
-                        INSERT INTO chunks_meta
-                            (url, title, depth, source_type, category, fetched_at,
-                             text, text_clean, chunk_index, chunk_len, chunk_type)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        chunk.get("url", ""),
-                        chunk.get("title", ""),
-                        chunk.get("depth", 0),
-                        chunk.get("source_type", ""),
-                        chunk.get("category", ""),
-                        chunk.get("fetched_at", ""),
-                        chunk.get("text", ""),
-                        text_clean,
-                        chunk.get("chunk_index", 0),
-                        chunk.get("chunk_len", 0),
-                        chunk.get("chunk_type", "content"),
-                    ))
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        text_clean = chunk.get("text_clean", chunk.get("text", ""))
+                        subdomain = chunk.get("subdomain") or path_subdomain
 
-                    # Insert jieba-segmented text into FTS5
-                    # rowid matches chunks_meta.rowid (both auto-increment from 1)
-                    conn.execute(
-                        "INSERT INTO chunks_fts(rowid, text_segmented) VALUES (?, ?)",
-                        (total + 1, _segment(text_clean))
-                    )
-                    total += 1
+                        # Insert metadata
+                        conn.execute("""
+                            INSERT INTO chunks_meta
+                                (url, title, subdomain, depth, source_type, category, fetched_at,
+                                 text, text_clean, chunk_index, chunk_len, chunk_type)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            chunk.get("url", ""),
+                            chunk.get("title", ""),
+                            subdomain,
+                            chunk.get("depth", 0),
+                            chunk.get("source_type", ""),
+                            chunk.get("category", ""),
+                            chunk.get("fetched_at", ""),
+                            chunk.get("text", ""),
+                            text_clean,
+                            chunk.get("chunk_index", 0),
+                            chunk.get("chunk_len", 0),
+                            chunk.get("chunk_type", "content"),
+                        ))
 
-                    if total % 2000 == 0:
-                        print(f"  [{total}] chunks indexed...")
-                        conn.commit()
+                        # Insert jieba-segmented text into FTS5
+                        # rowid matches chunks_meta.rowid (both auto-increment from 1)
+                        conn.execute(
+                            "INSERT INTO chunks_fts(rowid, text_segmented) VALUES (?, ?)",
+                            (total + 1, _segment(text_clean))
+                        )
+                        total += 1
+
+                        if total % 2000 == 0:
+                            print(f"  [{total}] records indexed...")
+                            conn.commit()
 
             conn.commit()
 
-            print(f"FTS5 index built: {total} chunks indexed -> {self._db_path}")
+            print(f"FTS5 index built: {total} records indexed from {len(existing_paths)} "
+                  f"file(s) -> {self._db_path}")
             return total
 
         finally:

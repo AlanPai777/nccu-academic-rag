@@ -13,6 +13,7 @@ rag/cache.db
 rag/cache.db.bak
 *.db.bak
 rag/fts.db
+rag/fts_proto3.db
 
 # Python
 venv/
