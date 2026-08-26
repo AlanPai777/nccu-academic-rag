@@ -78,7 +78,7 @@ _TITLE_WORDS = {
     "資深約用心理師", "新生書院導師", "書院專案助理", "專案行政專員", "定期約用人員",
     "計畫專任助理", "住宿組組長", "約用心理師", "約用社工師", "約用社工員", "約用護理師",
     "約用職代", "專任助理", "中心主任", "職涯總監", "中心秘書", "中心組長", "輔導員",
-    "護理師", "一級技術師", "工程師", "技術師", "技士",
+    "護理師", "一級技術師", "工程師", "技術師", "技士", "工友",
 }
 
 # Tier 1: explicitly-labeled fields ("分機"/"校內分機" immediately before the
@@ -215,32 +215,135 @@ def _parse_flattened_table(text: str) -> list[dict]:
     return contacts
 
 
+# Tier 3: title/name/duty/ext/deputy 5-column flattened table (aca's
+# 教務長室/註冊組/課務組 "人員職掌" pages) — a structurally different table
+# shape from Tier 2's aca-3-column format: the column header itself names 5
+# fields ("職稱/姓名/業務項目/(校內)分機/職務代理人"), and critically each
+# person's OWN row is followed by up to 2 DEPUTY references (their own
+# "name" + "(ext)" pair) before the next person's row starts — Tier 2's
+# "last pure-name-line before the ext wins" heuristic breaks here because a
+# deputy reference is itself a valid-looking name, and worse, a duty-list
+# item that happens to be a bare 2-4 hanzi phrase (e.g. "評鑑業務",
+# "財產管理") can also match and silently win, producing a duty phrase
+# masquerading as a person's name (found empirically on 教務長室's own
+# text during Phase F Step 5, 2026-08-26 — not a hypothetical).
+#
+# Approach: split the post-header text into blank-line-separated paragraphs
+# and walk a small state machine — accumulate paragraphs as "title" text
+# until hitting a paragraph that (a) looks like a name AND (b) is NOT
+# immediately followed by a parenthesized "(ext)" (which would mark it as a
+# deputy reference, not this block's own owner); then scan forward,
+# ignoring everything (duty text, deputy pairs), until the next BARE
+# (non-parenthesized) 4-5 digit extension. Verified 2026-08-26 against all
+# 5 records in office_contacts_index.jsonl sharing this exact header
+# signature: 教務長室 (11/11 correct) and 課務組 (10/10 correct) parse
+# cleanly; 註冊組 is 12/13 (one entry's duty text is garbled because that
+# specific block's source HTML lacks the blank-line paragraph breaks this
+# parser relies on — name/ext still correct, only the duty string is
+# messy); 通識教育中心 and 文學院(成員執掌) do NOT parse correctly (a
+# further, different sub-structure — deputy pairs with trailing text
+# glued on, and an email-prefixed field this parser doesn't expect) but
+# are harmless dead code paths here: neither is ever queried by this
+# codebase — _OFFICE_NAME_MAP has no entry mapping to either name, so
+# dynamic_contacts_for_office() never reaches them regardless of how well
+# or badly this parser handles their text. This is a scoped fix for one
+# recurring CMS template confirmed across multiple real records, not a
+# general flattened-table parser — a page with the same 5 field concepts
+# under different header wording, a different column order, or a
+# different column count would not be caught by _TIER3_HEADER_RE at all
+# and would fall through to Tier 2 unchanged.
+_TIER3_HEADER_RE = re.compile(
+    r'職\s*稱\s*\n+\s*姓\s*名\s*\n+\s*業務項目\s*\n+\s*(?:校內)?分\s*機\s*\n+\s*職務代理人'
+)
+_TIER3_DEPUTY_EXT_RE = re.compile(r'^[（(]\d{4,5}[）)]$')
+_TIER3_BARE_EXT_RE   = re.compile(r'^\d{4,5}$')
+
+
+def _parse_title_name_table(text: str) -> list[dict] | None:
+    """Returns None if the Tier 3 header signature isn't present (caller
+    should fall through to Tier 2), else the parsed contact list (possibly
+    empty if the header matched but no valid blocks were found)."""
+    header_match = _TIER3_HEADER_RE.search(text)
+    if not header_match:
+        return None
+
+    paragraphs = [p.strip() for p in text[header_match.end():].split("\n\n") if p.strip()]
+    contacts: list[dict] = []
+    i, n = 0, len(paragraphs)
+    while i < n:
+        title_parts: list[str] = []
+        while i < n:
+            # Deputy-reference pair check MUST come before the name check —
+            # a deputy reference IS name-shaped text, so checking name-ness
+            # first would wrongly treat it as this block's own owner.
+            if i + 1 < n and _TIER3_DEPUTY_EXT_RE.match(paragraphs[i + 1]):
+                i += 2
+                continue
+            name_match = _PURE_NAME_LINE_RE.match(paragraphs[i])
+            if name_match and name_match.group(1) not in _TITLE_WORDS:
+                break
+            if _TIER3_BARE_EXT_RE.match(paragraphs[i]):
+                i += 1
+                continue
+            title_parts.append(paragraphs[i])
+            i += 1
+            if len(title_parts) > 6:  # safety cap against a malformed tail
+                break
+        if i >= n:
+            break
+        name_match = _PURE_NAME_LINE_RE.match(paragraphs[i])
+        if not name_match or name_match.group(1) in _TITLE_WORDS:
+            i += 1
+            continue
+        name = name_match.group(1)
+        i += 1
+        ext = None
+        while i < n:
+            if _TIER3_BARE_EXT_RE.match(paragraphs[i]):
+                ext = paragraphs[i]
+                i += 1
+                break
+            i += 1
+        if name and ext:
+            contacts.append({
+                "name": name, "ext": ext, "email": None,
+                "duty": "".join(title_parts),
+            })
+    return contacts
+
+
 def parse_office_contacts(text: str) -> list[dict]:
     """
     Extract [{name, ext, email, duty}, ...] from one office_contacts_index.jsonl
     record's raw text. Tries the labeled-field parser first (works for most
-    CMS layouts observed); falls back to the flattened-table parser only when
-    BOTH the labeled parser found nothing AND "分機" appears just a handful of
-    times in the whole page (<=3) — the fingerprint of a genuine flattened
-    table, where the column header ("職稱/姓名/業務項目/分機/..." on aca's
-    pages, "館名/單位/...校內分機/..." on the library's) appears exactly
-    once and per-row values are bare, unlabeled numbers. A page where "分機"
-    appears many times (oic: 36) means every person already has their OWN
-    labeled "分機：" — tier 1 correctly tried all of them and correctly found
-    no reliable name for any (oic's bios end in institutional phrases with no
-    name nearby), and falling back to the flattened-table guess there
-    misfired on oic's own short standalone duty-list lines (e.g. "校務評鑑",
-    "總務庶務") which happen to also match that parser's "short pure-hanzi
-    line" heuristic — producing confident-looking garbage names for a page
-    where no name is reliably in the text at all. Not a claim of 100%
-    precision on every subdomain's CMS quirks — good enough to identify the
-    right office and a plausible contact for it, which is the bar Phase F
-    set for this (see Step 0c contact.csv discussion); an office this can't
-    parse falls all the way back to KNOWN_CONTACTS via
-    dynamic_contacts_for_office(), not to a guess.
+    CMS layouts observed); then the Tier 3 5-column title/name/duty/ext/deputy
+    table (see _parse_title_name_table's docstring); falls back to the Tier 2
+    flattened-table parser only when BOTH the labeled parser found nothing AND
+    "分機" appears just a handful of times in the whole page (<=3) — the
+    fingerprint of a genuine flattened table, where the column header
+    ("職稱/姓名/業務項目/分機/..." on aca's pages, "館名/單位/...校內分機/..."
+    on the library's) appears exactly once and per-row values are bare,
+    unlabeled numbers. A page where "分機" appears many times (oic: 36) means
+    every person already has their OWN labeled "分機：" — tier 1 correctly
+    tried all of them and correctly found no reliable name for any (oic's
+    bios end in institutional phrases with no name nearby), and falling back
+    to the flattened-table guess there misfired on oic's own short standalone
+    duty-list lines (e.g. "校務評鑑", "總務庶務") which happen to also match
+    that parser's "short pure-hanzi line" heuristic — producing
+    confident-looking garbage names for a page where no name is reliably in
+    the text at all. Not a claim of 100% precision on every subdomain's CMS
+    quirks — good enough to identify the right office and a plausible
+    contact for it, which is the bar Phase F set for this (see Step 0c
+    contact.csv discussion); an office this can't parse falls all the way
+    back to KNOWN_CONTACTS via dynamic_contacts_for_office(), not to a guess.
     """
     contacts = _parse_labeled(text)
-    if not contacts and text.count("分機") <= 3:
+    if contacts:
+        return contacts
+    tier3 = _parse_title_name_table(text)
+    if tier3 is not None:
+        return tier3
+    if text.count("分機") <= 3:
         contacts = _parse_flattened_table(text)
     return contacts
 
