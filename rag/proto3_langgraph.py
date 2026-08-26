@@ -416,17 +416,39 @@ def _offices_from_query(query: str) -> list[str]:
     return [name for name in _ALL_OFFICE_NAMES if name in query]
 
 
+def _offices_from_context(context_pages: list[dict]) -> list[str]:
+    """
+    Condition 3: detect which offices are actually mentioned in retrieved
+    content, replacing the hardcoded _PROCEDURE_OFFICES injection every
+    PROCEDURE answer used to get regardless of relevance. Reuses condition
+    4's dynamic contact-lookup infrastructure (checks against the same
+    _PROCEDURE_OFFICES keys OfficeLookupSkill/_OFFICE_NAME_MAP already
+    understand) — this function only decides WHICH offices to look up, not
+    how to look them up.
+
+    Deliberately narrow scope (Phase F Step 4): only this detection function
+    is new. retrieval_node's own fetch logic is untouched — Step 4.5's
+    anchor+expand redesign re-wires retrieval around this exact function
+    rather than rewriting the detection itself.
+    """
+    combined = " ".join(p.get("text", "") for p in context_pages)
+    return [office for office in _PROCEDURE_OFFICES if office in combined]
+
+
 def office_lookup_node(state: AgentState) -> AgentState:
     """
     Inject office contact info into synthesis context.
 
-    PROCEDURE: always inject all key offices (KNOWN_CONTACTS always-on,
-               not dependent on dynamic grep success).
+    PROCEDURE: offices actually mentioned in context_pages (condition 3,
+               _offices_from_context) — falls back to all of _PROCEDURE_OFFICES
+               only if detection finds none (context_pages empty or no office
+               name matched at all).
     CONTACT:   inject offices mentioned in the query; fallback to all if none found.
     KNOWLEDGE: skip — office info not needed for factual queries.
 
-    OfficeLookupSkill first reads KNOWN_CONTACTS (static, reliable),
-    then supplements with dynamic grep from extracted_texts.jsonl.
+    OfficeLookupSkill's contact lookup is itself dynamic (condition 4,
+    office_contacts_index.jsonl primary, KNOWN_CONTACTS fallback) — this
+    node only decides WHICH offices to ask it about.
     """
     from rag.skills.office_lookup_skill import OfficeLookupSkill
 
@@ -436,7 +458,7 @@ def office_lookup_node(state: AgentState) -> AgentState:
         return {**state, "office_context": ""}
 
     if qtype == QueryType.PROCEDURE:
-        offices = _PROCEDURE_OFFICES
+        offices = _offices_from_context(state.get("context_pages", [])) or _PROCEDURE_OFFICES
     else:  # CONTACT
         offices = _offices_from_query(state["query"]) or _PROCEDURE_OFFICES
 
