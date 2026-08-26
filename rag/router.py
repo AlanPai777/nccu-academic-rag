@@ -60,6 +60,15 @@ _CONTACT_KEYWORDS = [
 
 # ── Layer 1: deterministic keyword matching ──────────────────────────────────
 
+def _dedupe_substring_matches(matched: list[str]) -> list[str]:
+    """
+    Drop a matched keyword if it's a substring of another matched keyword
+    in the same list (e.g. "在哪" matched inside "在哪裡") — otherwise the
+    same textual signal gets counted twice and skews proc_hits/cont_hits.
+    """
+    return [kw for kw in matched if not any(kw != other and kw in other for other in matched)]
+
+
 def _keyword_route(query: str) -> QueryType | None:
     """
     Return QueryType if keyword signal is clear; None if ambiguous.
@@ -67,8 +76,10 @@ def _keyword_route(query: str) -> QueryType | None:
     """
     q = query  # keep original case for Chinese matching
 
-    proc_hits = sum(1 for kw in _PROCEDURE_KEYWORDS if kw in q)
-    cont_hits = sum(1 for kw in _CONTACT_KEYWORDS   if kw in q)
+    proc_matched = _dedupe_substring_matches([kw for kw in _PROCEDURE_KEYWORDS if kw in q])
+    cont_matched = _dedupe_substring_matches([kw for kw in _CONTACT_KEYWORDS   if kw in q])
+    proc_hits = len(proc_matched)
+    cont_hits = len(cont_matched)
 
     if proc_hits > 0 and proc_hits > cont_hits:
         return QueryType.PROCEDURE
