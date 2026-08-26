@@ -3,17 +3,18 @@ rag/proto3_langgraph.py
 Prototype 3: LangGraph-based agentic RAG pipeline.
 
 Graph:
-  START → query_decomposition_node ──(not composite)──▶ router_node ──(PROCEDURE/KNOWLEDGE)──▶ retrieval_node ──▶ office_lookup_node
-                                  │                                 ╰──(CONTACT)─────────────────────────────────▶ office_lookup_node
-                                  │                                                                                        │
-                                  │                                                                                extraction_node
-                                  ╰──(composite)──▶ merge_node (v1: sequential loop over sub_queries — TODO: Send) ────────╯
-                                                                                                                             │
-                                                                                                                     synthesis_node ◀─╮
-                                                                                                                             │         │ correction_hint set
-                                                                                                                     self_eval_node ──╯ (max 2 retries)
-                                                                                                                             │
-                                                                                                                            END
+  START → query_decomposition_node ──(not composite)──▶ router_node ──(PROCEDURE)──▶ retrieval_anchor_node ─[Send ×N]─▶ retrieval_expand_node ──▶ office_lookup_node
+                                  │                                 ├──(KNOWLEDGE)──────────────────────────────────────────────────────────────▶ retrieval_node ──▶ office_lookup_node
+                                  │                                 ╰──(CONTACT)───────────────────────────────────────────────────────────────────────────────────▶ office_lookup_node
+                                  │                                                                                                                                          │
+                                  │                                                                                                                                  extraction_node
+                                  ╰──(composite)──▶ merge_node (v1: sequential loop over sub_queries, still ProcedureSkill-based — TODO: Send + anchor/expand) ─────────────╯
+                                                                                                                                                                              │
+                                                                                                                                                                      synthesis_node ◀─╮
+                                                                                                                                                                              │         │ correction_hint set
+                                                                                                                                                                      self_eval_node ──╯ (max 2 retries)
+                                                                                                                                                                              │
+                                                                                                                                                                             END
 
 Run:
     python -m rag.proto3_langgraph "如何辦理休學"
@@ -25,16 +26,18 @@ Run:
 from __future__ import annotations
 
 import json
+import operator
 import re
 import sys
-from typing import TypedDict
+from typing import Annotated, TypedDict
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
 
 from rag.router import route, QueryType, _keyword_route
 from rag.llm_client import chat_with_tools, simple_chat, get_active_model, PROVIDER
 from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form, extract_form_ids
-from rag.skills.procedure_skill import ProcedureSkill
+from rag.skills.procedure_skill import ProcedureSkill, _extract_keyword
 from rag.eval import print_score_report
 
 
@@ -45,11 +48,22 @@ class AgentState(TypedDict):
     query_type:           str        # "procedure" / "contact" / "knowledge"
     route_method:         str        # "keyword" / "llm" / "default"
     sub_queries:          list[str]  # Step 2.5: non-empty only for composite queries
-    context_pages:        list[dict] # retrieved pages (PROCEDURE / KNOWLEDGE)
+    # Annotated with operator.add so N parallel retrieval_expand_node branches
+    # (Step 4.5, Send-based fan-out) each contribute their own page/URL without
+    # clobbering each other or the anchor node's own contribution — LangGraph
+    # sums all writes to this field within one superstep. Safe because exactly
+    # one path (anchor+expand XOR retrieval_node XOR merge_node) ever writes to
+    # it per graph run, always starting from the [] set in run()'s initial state.
+    context_pages:        Annotated[list[dict], operator.add]
+    sources:               Annotated[list[str], operator.add]
+    detected_offices:     list[str]  # Step 4.5: set by retrieval_anchor_node so
+                                      # office_lookup_node doesn't re-detect (condition 3)
+    _anchor_links:        list[str]  # Step 4.5: cross-domain links found in anchor content
+    _anchor_form_ids:     list[str]  # Step 4.5: form IDs found in anchor content
+    expand_target:        dict       # Step 4.5: per-Send-branch payload {"kind","value"}
     office_context:       str        # formatted contact info — E3: OfficeLookupSkill
     extraction_checklist: dict       # condition 6: pre-synthesis dynamic checklist
     answer:               str        # final answer
-    sources:              list[str]  # cited URLs
     correction_hint:      str        # E4: self-eval feedback for synthesis retry
     iteration:            int        # E4: retry counter (max _MAX_SELF_EVAL_RETRIES)
 
@@ -306,8 +320,19 @@ def retrieval_node(state: AgentState) -> AgentState:
     """
     Fetch relevant pages.
 
-    PROCEDURE → ProcedureSkill (deterministic 3-step: grep → links → form)
-    KNOWLEDGE → LLM-driven agent loop (grep + get_page)
+    KNOWLEDGE → LLM-driven agent loop (grep + get_page) — the main-path use.
+    PROCEDURE → ProcedureSkill (deterministic 3-step: grep → links → form) —
+                kept ONLY for merge_node's composite-sub-query loop (Step 2.5),
+                which calls this function directly and isn't wired through
+                Send. The main single-query PROCEDURE path no longer reaches
+                this branch: router_node routes PROCEDURE to
+                retrieval_anchor_node instead (Step 4.5, condition 2) — same
+                grep→links→form idea, but anchor is sequential/deterministic
+                and links+forms expand in parallel via Send instead of
+                ProcedureSkill's fixed sequential loop. Known follow-up, not
+                yet done: give merge_node's composite path the same
+                anchor+expand adaptivity — it still uses this fixed 3-step
+                version for now.
     CONTACT   → not reached (conditional edge routes directly to office_lookup_node)
     """
     query = state["query"]
@@ -435,14 +460,137 @@ def _offices_from_context(context_pages: list[dict]) -> list[str]:
     return [office for office in _PROCEDURE_OFFICES if office in combined]
 
 
+# ── Step 4.5 (condition 2): anchor + expand ──────────────────────────────────
+# Replaces ProcedureSkill's fixed 3-step (grep → links → form) for the main
+# single-query PROCEDURE path. anchor is sequential/deterministic (low risk,
+# no LLM judgment); expand fans out via LangGraph's native Send API — one
+# branch per cross-domain link or form ID actually found in anchor content,
+# not a hardcoded or LLM-guessed count. No ToolNode/Ollama-Cloud-compatibility
+# dependency here — Send is pure LangGraph graph mechanics.
+
+def retrieval_anchor_node(state: AgentState) -> AgentState:
+    """
+    Sequential step: grep_texts + get_page to find the main page(s) — same
+    idea as ProcedureSkill's old step 1, reusing its _extract_keyword()
+    stripping helper rather than reimplementing it.
+
+    Also runs office detection (condition 3, _offices_from_context) on JUST
+    the anchor content, immediately — earlier than before, so
+    office_lookup_node doesn't need to re-detect after expand completes
+    (its own docstring covers why). And collects the cross-domain links +
+    form IDs mentioned in anchor content into detected_offices/expand
+    candidates for _dispatch_expand to fan out over.
+    """
+    query = state["query"]
+    keyword = _extract_keyword(query)
+
+    main_results = grep_texts(keyword, subdomain="aca", max_results=5)
+    if not main_results:
+        main_results = grep_texts(keyword, max_results=5)
+
+    anchor_pages: list[dict] = []
+    seen_urls: set[str] = set()
+    for r in main_results:
+        if r["url"] not in seen_urls:
+            full = get_page(r["url"])
+            if "error" not in full:
+                anchor_pages.append(full)
+                seen_urls.add(r["url"])
+
+    links: list[str] = []
+    for page in anchor_pages:
+        for link in extract_links(page["url"]):
+            if link["url"] not in seen_urls:
+                links.append(link["url"])
+                seen_urls.add(link["url"])
+
+    all_text = " ".join(p.get("text", "") for p in anchor_pages[:3])
+    form_ids = extract_form_ids(all_text)
+
+    return {
+        **state,
+        "context_pages":    anchor_pages,
+        "sources":          [p["url"] for p in anchor_pages],
+        "detected_offices": _offices_from_context(anchor_pages),
+        "_anchor_links":    links,
+        "_anchor_form_ids": form_ids,
+    }
+
+
+def _dispatch_expand(state: AgentState) -> list[Send]:
+    """
+    Conditional-edge routing function: builds one Send per expand target
+    (link or form ID found by retrieval_anchor_node) — N determined by what
+    anchor actually found, not fixed or LLM-guessed. If anchor found nothing
+    to expand, Send straight to office_lookup_node so the graph still
+    proceeds (an empty Send list would stall the graph, not skip forward).
+    """
+    targets = [
+        Send("retrieval_expand_node", {**state, "expand_target": {"kind": "link", "value": link}})
+        for link in state.get("_anchor_links", [])
+    ] + [
+        Send("retrieval_expand_node", {**state, "expand_target": {"kind": "form", "value": fid}})
+        for fid in state.get("_anchor_form_ids", [])
+    ]
+    if not targets:
+        return [Send("office_lookup_node", state)]
+    return targets
+
+
+def retrieval_expand_node(state: AgentState) -> AgentState:
+    """
+    One Send-dispatched branch: fetches exactly ONE expand target (a single
+    get_page(link) or get_form(form_id) call) and contributes it to
+    context_pages/sources via the operator.add reducer — LangGraph merges
+    all N branches' contributions (plus retrieval_anchor_node's own) once
+    every branch completes, before office_lookup_node runs.
+
+    ⚠️ Must return ONLY the fields being updated (context_pages/sources), NOT
+    `**state` — N branches run concurrently in the same superstep, and
+    spreading the full state means every branch also "writes" every
+    unchanged field (query, query_type, ...); those are plain last-value
+    channels, so N parallel writes to the same non-reducer field raises
+    InvalidUpdateError ("Can receive only one value per step"). Confirmed by
+    hitting exactly this error before fixing it — not a hypothetical concern.
+    """
+    target = state.get("expand_target", {})
+    kind, value = target.get("kind"), target.get("value")
+
+    if kind == "link":
+        page = get_page(value)
+        if "error" in page:
+            return {"context_pages": [], "sources": []}
+        return {"context_pages": [page], "sources": [page["url"]]}
+
+    if kind == "form":
+        form = get_form(value)
+        if "error" in form:
+            return {"context_pages": [], "sources": []}
+        page = {"url": form["url"], "title": form.get("form_title", ""), "text": form.get("text", "")}
+        return {"context_pages": [page], "sources": [page["url"]]}
+
+    return {"context_pages": [], "sources": []}
+
+
 def office_lookup_node(state: AgentState) -> AgentState:
     """
     Inject office contact info into synthesis context.
 
-    PROCEDURE: offices actually mentioned in context_pages (condition 3,
-               _offices_from_context) — falls back to all of _PROCEDURE_OFFICES
-               only if detection finds none (context_pages empty or no office
-               name matched at all).
+    PROCEDURE: runs _offices_from_context() fresh, on the FULL context_pages
+               (Step 4.5 fixed this 2026-08-26: originally prioritized
+               detected_offices, which retrieval_anchor_node snapshots from
+               ONLY its own anchor pages before the Send-based expand fan-out
+               has run — office names that only appear in expand-fetched
+               content, e.g. 休學's moltke form mentioning 住宿組/國際合作事務處,
+               were silently missed. context_pages is the merged anchor+all-
+               expand-branches set by the time THIS node runs (fan-in already
+               complete via the operator.add reducer), so re-running the same
+               detection function against it is provably a superset of the
+               anchor-only snapshot — negligible cost (pure substring scan,
+               no I/O/LLM), so there's no real reason to prefer the narrower
+               snapshot. detected_offices is kept as a field (still useful as
+               an early signal if expand's own targeting gets smarter later)
+               but is no longer this node's primary source.
     CONTACT:   inject offices mentioned in the query; fallback to all if none found.
     KNOWLEDGE: skip — office info not needed for factual queries.
 
@@ -683,7 +831,9 @@ def _after_decomposition(state: AgentState) -> str:
 def _after_router(state: AgentState) -> str:
     if state["query_type"] == QueryType.CONTACT:
         return "office_lookup_node"
-    return "retrieval_node"
+    if state["query_type"] == QueryType.PROCEDURE:
+        return "retrieval_anchor_node"  # Step 4.5: anchor+expand, not retrieval_node
+    return "retrieval_node"  # KNOWLEDGE
 
 
 def _after_self_eval(state: AgentState) -> str:
@@ -744,22 +894,26 @@ def build_graph():
     g = StateGraph(AgentState)
 
     g.add_node("query_decomposition_node", query_decomposition_node)
-    g.add_node("merge_node",         merge_node)
-    g.add_node("router_node",        router_node)
-    g.add_node("retrieval_node",     retrieval_node)
-    g.add_node("office_lookup_node", office_lookup_node)
-    g.add_node("extraction_node",    extraction_node)
-    g.add_node("synthesis_node",     synthesis_node)
-    g.add_node("self_eval_node",     self_eval_node)
+    g.add_node("merge_node",           merge_node)
+    g.add_node("router_node",          router_node)
+    g.add_node("retrieval_anchor_node", retrieval_anchor_node)
+    g.add_node("retrieval_expand_node", retrieval_expand_node)
+    g.add_node("retrieval_node",       retrieval_node)
+    g.add_node("office_lookup_node",   office_lookup_node)
+    g.add_node("extraction_node",      extraction_node)
+    g.add_node("synthesis_node",       synthesis_node)
+    g.add_node("self_eval_node",       self_eval_node)
 
     g.add_edge(START, "query_decomposition_node")
     g.add_conditional_edges("query_decomposition_node", _after_decomposition)
-    g.add_edge("merge_node",         "synthesis_node")
-    g.add_conditional_edges("router_node",    _after_router)
-    g.add_edge("retrieval_node",     "office_lookup_node")
-    g.add_edge("office_lookup_node", "extraction_node")
-    g.add_edge("extraction_node",    "synthesis_node")
-    g.add_edge("synthesis_node",     "self_eval_node")
+    g.add_edge("merge_node",            "synthesis_node")
+    g.add_conditional_edges("router_node", _after_router)
+    g.add_conditional_edges("retrieval_anchor_node", _dispatch_expand)
+    g.add_edge("retrieval_expand_node", "office_lookup_node")
+    g.add_edge("retrieval_node",        "office_lookup_node")
+    g.add_edge("office_lookup_node",    "extraction_node")
+    g.add_edge("extraction_node",       "synthesis_node")
+    g.add_edge("synthesis_node",        "self_eval_node")
     g.add_conditional_edges("self_eval_node", _after_self_eval)
 
     return g.compile()
@@ -779,10 +933,14 @@ def run(query: str) -> str:
         "route_method":         "",
         "sub_queries":          [],
         "context_pages":        [],
+        "sources":              [],
+        "detected_offices":     [],
+        "_anchor_links":        [],
+        "_anchor_form_ids":     [],
+        "expand_target":        {},
         "office_context":       "",
         "extraction_checklist": {},
         "answer":               "",
-        "sources":              [],
         "correction_hint":      "",
         "iteration":            0,
     })

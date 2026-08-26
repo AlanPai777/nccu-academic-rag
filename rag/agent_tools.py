@@ -100,16 +100,41 @@ def grep_texts(
 
 # ── Tool 2: get_page ──────────────────────────────────────────────────────────
 
-def get_page(url: str) -> dict:
+def get_page(url: str, subdomain: str | None = None) -> dict:
     """
     Fetch full page text for a specific URL (whole page, not chunked).
     Falls back to prefix matching when the stored URL is a child of the input URL.
     Example: input '/休退學' matches stored '/休退學暨研究生畢業退費/休-退-學退費標準'.
     Returns {url, title, text, subdomain}
+
+    subdomain: optional hint to search just that subdomain's files first,
+               skipping the full 231-subdomain scan when the caller already
+               knows it (e.g. OfficeLookupSkill._find_pages() gets the
+               subdomain straight from OFFICE_SOURCES — confirmed via Phase F
+               Step 4.5 timing that scanning all 231 subdomains per candidate
+               URL, when the answer is already known, was the single largest
+               contributor to office_lookup_node's latency: 66s for 生僑組
+               alone). Falls back to the unscoped global search if nothing
+               matches there — defensive against a wrong/stale hint, never a
+               source of false negatives.
     """
     decoded = urllib.parse.unquote(url)
 
-    for path in _extracted_paths(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl"):
+    search_globs = []
+    if subdomain:
+        search_globs.append(f"{CRAWLER_OUTPUT}/{subdomain}/extracted_*.jsonl")
+    search_globs.append(f"{CRAWLER_OUTPUT}/*/extracted_*.jsonl")
+
+    for search_glob in search_globs:
+        result = _search_pages_for_url(search_glob, url, decoded)
+        if result is not None:
+            return result
+    return {"error": f"URL not found: {url}"}
+
+
+def _search_pages_for_url(search_glob: str, url: str, decoded: str) -> dict | None:
+    """Shared search loop for get_page()'s scoped and fallback passes."""
+    for path in _extracted_paths(search_glob):
         if not Path(path).exists():
             continue
         try:
@@ -148,7 +173,7 @@ def get_page(url: str) -> dict:
                 }
         except subprocess.TimeoutExpired:
             pass
-    return {"error": f"URL not found: {url}"}
+    return None
 
 
 # ── Tool 3: extract_links ─────────────────────────────────────────────────────

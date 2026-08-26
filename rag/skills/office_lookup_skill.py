@@ -21,6 +21,7 @@ Data sources (in priority order):
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from rag.agent_tools import grep_texts, get_page
@@ -416,7 +417,11 @@ def _find_pages(office: str) -> list[dict]:
         for r in results:
             if r["url"] in seen_urls:
                 continue
-            page = get_page(r["url"])
+            # subdomain is already known from OFFICE_SOURCES — pass it through
+            # so get_page() skips its full 231-subdomain scan (Phase F Step
+            # 4.5 timing: this was the single largest latency contributor,
+            # 66s for 生僑組 alone with 5+ get_page() calls per office).
+            page = get_page(r["url"], subdomain=subdomain)
             if "error" not in page and _page_mentions_office(page["text"], office):
                 seen_urls.add(r["url"])
                 pages.append(page)
@@ -433,73 +438,91 @@ class OfficeLookupSkill:
         # info["生僑組"] = {"floor": "行政大樓 3 樓", "phones": [...], "note": "..."}
     """
 
+    def _lookup_one(self, office: str) -> dict:
+        """
+        Everything run() needs to compute for ONE office. Extracted so run()
+        can dispatch offices across a thread pool (Phase F Step 4.5 timing:
+        this was found to be the largest single latency contributor —
+        offices were processed one at a time, so office N's cost added onto
+        every prior office's cost instead of overlapping. get_page() calls
+        inside _find_pages() are I/O-bound (subprocess grep), so real
+        concurrency here is a genuine speedup, not just apparent — the same
+        justification already established for retrieval_expand_node's Send
+        fan-out. ThreadPoolExecutor, not Send: offices is always a small,
+        already-known list (never dynamically discovered like expand's
+        links/forms), so there's no dynamic fan-out count to justify going
+        through the graph — a plain thread pool inside this one method is
+        the right-sized tool.
+        """
+        # Condition 4: dynamic lookup is primary; KNOWN_CONTACTS is the
+        # fallback only when the dynamic index has nothing for this office.
+        contacts = dynamic_contacts_for_office(office) or KNOWN_CONTACTS.get(office, [])
+        entry: dict = {
+            "office":    office,
+            "floor":     KNOWN_FLOORS.get(office),
+            "phones":    [],
+            "contacts":  contacts,
+            "page_url":  None,
+            "note":      "",
+        }
+
+        pages = _find_pages(office)
+        if not pages:
+            return entry
+
+        entry["page_url"] = pages[0]["url"]
+
+        # Merge phones from all found pages (extensions first, then direct lines)
+        all_phones: list[str] = []
+        search_names = [office] + OFFICE_ALIASES.get(office, [])
+        for page in pages:
+            for name in search_names:
+                all_phones.extend(_extract_phones_near(page["text"], name))
+            if not all_phones:
+                # Fallback: first direct phone number on page (e.g. oic Post/800)
+                matches = _PHONE_RE.findall(page["text"])
+                if matches:
+                    all_phones.append(matches[0][0] or matches[0][1])
+        # Supplement with extensions from KNOWN_CONTACTS if dynamic lookup found none
+        if not all_phones and entry["contacts"]:
+            all_phones = [c["ext"] for c in entry["contacts"] if c.get("ext")]
+        entry["phones"] = list(dict.fromkeys(all_phones))
+
+        # Look for responsible person (姓名 + 職掌 containing 休退學/退費)
+        # Priority: 休退學 > 退費 (to avoid matching 學雜費退費 handlers)
+        for page in pages:
+            text = page["text"]
+            blocks = re.split(r'職稱', text)
+            best: tuple[int, str] = (99, "")  # (priority, note)
+            for block in blocks:
+                if "姓名" not in block:
+                    continue
+                priority = 99
+                if "休退學" in block:
+                    priority = 0
+                elif "退費" in block and priority == 99:
+                    priority = 1
+                if priority == 99:
+                    continue
+                # Chinese name only (stop before spaces or English)
+                name_match = re.search(r'姓名\s*\n?\s*([一-鿿]{2,5})', block)
+                ext_match  = re.search(r'分機\s*\n?\s*(\d{4,5})', block)
+                if name_match and priority < best[0]:
+                    name = name_match.group(1)
+                    ext  = ext_match.group(1) if ext_match else ""
+                    best = (priority, f"承辦人（休退學）：{name}" + (f"，分機 {ext}" if ext else ""))
+            if best[1]:
+                entry["note"] = best[1]
+                break
+
+        return entry
+
     def run(self, offices: list[str]) -> dict[str, dict]:
-        result = {}
-        for office in offices:
-            # Condition 4: dynamic lookup is primary; KNOWN_CONTACTS is the
-            # fallback only when the dynamic index has nothing for this office.
-            contacts = dynamic_contacts_for_office(office) or KNOWN_CONTACTS.get(office, [])
-            entry: dict = {
-                "office":    office,
-                "floor":     KNOWN_FLOORS.get(office),
-                "phones":    [],
-                "contacts":  contacts,
-                "page_url":  None,
-                "note":      "",
-            }
-
-            pages = _find_pages(office)
-            if not pages:
-                result[office] = entry
-                continue
-
-            entry["page_url"] = pages[0]["url"]
-
-            # Merge phones from all found pages (extensions first, then direct lines)
-            all_phones: list[str] = []
-            search_names = [office] + OFFICE_ALIASES.get(office, [])
-            for page in pages:
-                for name in search_names:
-                    all_phones.extend(_extract_phones_near(page["text"], name))
-                if not all_phones:
-                    # Fallback: first direct phone number on page (e.g. oic Post/800)
-                    matches = _PHONE_RE.findall(page["text"])
-                    if matches:
-                        all_phones.append(matches[0][0] or matches[0][1])
-            # Supplement with extensions from KNOWN_CONTACTS if dynamic lookup found none
-            if not all_phones and entry["contacts"]:
-                all_phones = [c["ext"] for c in entry["contacts"] if c.get("ext")]
-            entry["phones"] = list(dict.fromkeys(all_phones))
-
-            # Look for responsible person (姓名 + 職掌 containing 休退學/退費)
-            # Priority: 休退學 > 退費 (to avoid matching 學雜費退費 handlers)
-            for page in pages:
-                text = page["text"]
-                blocks = re.split(r'職稱', text)
-                best: tuple[int, str] = (99, "")  # (priority, note)
-                for block in blocks:
-                    if "姓名" not in block:
-                        continue
-                    priority = 99
-                    if "休退學" in block:
-                        priority = 0
-                    elif "退費" in block and priority == 99:
-                        priority = 1
-                    if priority == 99:
-                        continue
-                    # Chinese name only (stop before spaces or English)
-                    name_match = re.search(r'姓名\s*\n?\s*([一-鿿]{2,5})', block)
-                    ext_match  = re.search(r'分機\s*\n?\s*(\d{4,5})', block)
-                    if name_match and priority < best[0]:
-                        name = name_match.group(1)
-                        ext  = ext_match.group(1) if ext_match else ""
-                        best = (priority, f"承辦人（休退學）：{name}" + (f"，分機 {ext}" if ext else ""))
-                if best[1]:
-                    entry["note"] = best[1]
-                    break
-
-            result[office] = entry
-        return result
+        if len(offices) <= 1:
+            return {o: self._lookup_one(o) for o in offices}
+        with ThreadPoolExecutor(max_workers=len(offices)) as ex:
+            entries = list(ex.map(self._lookup_one, offices))
+        return dict(zip(offices, entries))
 
     def format_context(self, lookup_result: dict[str, dict]) -> str:
         """Return a compact text block suitable for LLM synthesis context."""
