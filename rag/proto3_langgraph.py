@@ -264,7 +264,9 @@ def merge_node(state: AgentState) -> AgentState:
     office_sections: list[str] = []
     merged_person_names: list[dict] = []
     merged_forms: list[dict] = []
+    merged_notes: list[str] = []
     seen_form_ids: set[str] = set()
+    seen_notes: set[str] = set()
 
     for sub_query in state["sub_queries"]:
         result = route(sub_query)
@@ -296,6 +298,10 @@ def merge_node(state: AgentState) -> AgentState:
             if f["id"] not in seen_form_ids:
                 seen_form_ids.add(f["id"])
                 merged_forms.append(f)
+        for n in checklist.get("notes", []):
+            if n["text"] not in seen_notes:
+                seen_notes.add(n["text"])
+                merged_notes.append(n)
 
     return {
         **state,
@@ -305,6 +311,7 @@ def merge_node(state: AgentState) -> AgentState:
         "extraction_checklist": {
             "person_names": merged_person_names,
             "forms":        merged_forms,
+            "notes":        merged_notes,
         },
         # Composite answers always go through the full prompt-based synthesis
         # (office_section + checklist), never the KNOWLEDGE pass-through —
@@ -641,6 +648,51 @@ def office_lookup_node(state: AgentState) -> AgentState:
     }
 
 
+# Matches the numbering conventions Chinese-language forms use for
+# "注意事項"/"說明"-style enumerated notes — Arabic-顿號 ("1、2、3、...",
+# 休學's QP-T01-03-02), Chinese-numeral-顿號 ("一、二、三、...", 復學's
+# QP-T01-03-04, which also nests an Arabic sub-list under one item), and
+# Arabic-句點 ("1. 2. 3. ...", QP-T01-02-05's own "委託代辦說明" section —
+# found 2026-08-26 while checking whether this regex generalized: it didn't,
+# 0 notes extracted from that form until this separator was added).
+# Deliberately a closed, enumerable set (unlike open-ended vocabularies such
+# as office job titles) — Chinese formal documents only use a small number
+# of numbering conventions, so widening this regex to cover them is not the
+# same class of blind spot as _ADMIN_TITLES (office_lookup_skill.py); still,
+# no claim this exhausts every convention (e.g. ①②③ or （一）（二） are not
+# covered) — just the ones confirmed present in this corpus so far.
+_NOTE_MARKER_RE = re.compile(r'(?:^|(?<=[。\s]))([一二三四五六七八九十]{1,3}|[0-9]{1,2})[、.]')
+_TRAILING_TABLE_PIPES_RE = re.compile(r'(\s*\|)+\s*$')
+
+
+def _extract_candidate_notes(text: str) -> list[str]:
+    """
+    Find "注意事項"-style enumerated notes and return each item as its own
+    string. Scoped to ONE LINE at a time (`\\n`-split) rather than scanning
+    the whole page/form text — 2026-08-26 lesson from a reverted earlier
+    attempt: these notes live inside a single markdown table ROW (one
+    source-line per row), sandwiched between unrelated rows before and
+    after (e.g. QP-T01-03-02's 說明 row sits between a 住宿組/國際學生 row
+    and a 申請人簽章/領取方式 row). Cutting from the first marker to the
+    end of the whole text crossed those row boundaries and mangled both
+    the notes and the unrelated rows around them. A line needs 2+ markers
+    to count (avoids firing on a single stray "N、" inside ordinary prose,
+    e.g. a line mentioning "7日內" without being a real enumerated list).
+    """
+    notes: list[str] = []
+    for line in text.split("\n"):
+        markers = list(_NOTE_MARKER_RE.finditer(line))
+        if len(markers) < 2:
+            continue
+        for i, m in enumerate(markers):
+            start = m.end()
+            end = markers[i + 1].start() if i + 1 < len(markers) else len(line)
+            item = _TRAILING_TABLE_PIPES_RE.sub("", line[start:end]).strip()
+            if item:
+                notes.append(item)
+    return notes
+
+
 def extraction_node(state: AgentState) -> AgentState:
     """
     Condition 6: build a fact checklist from what retrieval/office_lookup
@@ -694,13 +746,32 @@ def extraction_node(state: AgentState) -> AgentState:
         )
         forms.append({"id": fid, "title": title})
 
+    # Tagged with source_title (not flattened into one pool) so the prompt
+    # can present notes grouped by which page/form they came from — 2026-08-26
+    # finding: a straight flat list mixed 休學's own 6-8 notes with 7 more
+    # from 復學's QP-T01-03-04 (cross-referenced on the same aca overview
+    # page, fetched by expand alongside 休學's own form), diluting the
+    # candidate pool with a different procedure's content. Reuses the SAME
+    # title-based relevance judgment _SYNTHESIS_PROMPT already asks the LLM
+    # to apply to `forms` below, instead of inventing a new filter.
+    notes: list[dict] = []
+    seen_notes: set[str] = set()
+    for page in context_pages:
+        source_title = page.get("title", "")
+        for note in _extract_candidate_notes(page.get("text", "")):
+            if note not in seen_notes:
+                seen_notes.add(note)
+                notes.append({"text": note, "source_title": source_title})
+
     checklist = {
         "person_names": person_names,
         "forms":        forms,
+        "notes":        notes,
     }
     print(
         f"[extraction] {len(person_names)} person(s), "
-        f"forms={[(f['id'], f['title']) for f in forms]}",
+        f"forms={[(f['id'], f['title']) for f in forms]}, "
+        f"notes={len(notes)}",
         file=sys.stderr,
     )
     return {**state, "extraction_checklist": checklist}
@@ -725,6 +796,17 @@ def _format_checklist(checklist: dict) -> str:
         for f in checklist["forms"]:
             title = f"（{f['title']}）" if f["title"] else ""
             lines.append(f"  • {f['id']}{title}")
+
+    if checklist.get("notes"):
+        lines.append("表單/頁面列出的補充說明事項（按來源分組——判斷相關性的方式跟上面「相關表單」規則一樣："
+                     "來源標題明顯是同一流程的，其補充說明若與學生情況相關就適當納入答案；"
+                     "來源標題明顯是不同流程的，整組可以略過，不需要每一則都寫進答案）：")
+        last_source = None
+        for n in checklist["notes"]:
+            if n["source_title"] != last_source:
+                lines.append(f"  [來源：{n['source_title'] or '（無標題）'}]")
+                last_source = n["source_title"]
+            lines.append(f"    • {n['text']}")
 
     if len(lines) == 1:
         return ""  # nothing extracted — omit the section entirely
@@ -810,6 +892,34 @@ _MAX_SELF_EVAL_RETRIES = 2
 # THIS query instead of a fixed list of 6 休學-specific names hardcoded regardless
 # of query type. sources/procedure_format stay static — they're format checks,
 # not content specific to any one procedure.
+def _char_bigrams(s: str) -> set[str]:
+    s = re.sub(r'\s+', '', s)
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else {s}
+
+
+def _note_referenced(note: str, answer: str, threshold: float = 0.4) -> bool:
+    """
+    Posthoc similarity check (FullCite-inspired, 2026-08-26) for whether a
+    checklist note's content shows up somewhere in the answer — used
+    instead of requiring the LLM to emit a rigid citation ID (which
+    "Models Can Model, But Can't Bind" and this session's own experience
+    both suggest is an unreliable ask of an untrained model) or requiring
+    literal substring match (too strict — the LLM is expected to
+    paraphrase/summarize a note, not quote the source verbatim). Character
+    bigram overlap coefficient (bigrams(note) ∩ bigrams(answer) /
+    bigrams(note)) rather than full Jaccard, since a short note compared
+    against the whole (much longer) answer via symmetric Jaccard would
+    always score near-zero regardless of match quality. Threshold 0.4
+    empirically separates a real paraphrase (~0.76 on a real 休學 note) from
+    unrelated answer text (~0.06) with margin to spare.
+    """
+    note_bg = _char_bigrams(note)
+    if not note_bg:
+        return False
+    answer_bg = _char_bigrams(answer)
+    return len(note_bg & answer_bg) / len(note_bg) >= threshold
+
+
 _SELF_EVAL_CRITERIA = [
     {
         "name":     "sources",
@@ -878,6 +988,29 @@ def self_eval_node(state: AgentState) -> AgentState:
     # 教務長 sub-cells) lives in context_pages' table structure, not in the
     # office contact roster; extracting that is a separate, harder task,
     # not done yet. See phase_f_planning_report.md Gotchas.
+
+    # mental_health_note (condition 6 extension, 2026-08-26): dynamic check
+    # against extraction_checklist's own "notes" — enumerated 注意事項 items
+    # regex-extracted from the actual form/page text (see
+    # _extract_candidate_notes), not any procedure-specific hardcoded
+    # phrase. Posthoc bigram-overlap matching (_note_referenced) instead of
+    # requiring exact substring or a citation ID, since the LLM is expected
+    # to paraphrase a note, not quote it verbatim. Same min(2, len()) floor
+    # as person_names — not "all notes must appear" (some may genuinely be
+    # irrelevant to this student's situation; forcing all of them in would
+    # risk the same over-inclusion problem office_role_diversity just hit).
+    checklist_notes = state.get("extraction_checklist", {}).get("notes", [])
+    if checklist_notes:
+        required = min(2, len(checklist_notes))
+        hits = sum(1 for n in checklist_notes if _note_referenced(n["text"], answer))
+        if hits < required:
+            unreferenced = [n["text"] for n in checklist_notes if not _note_referenced(n["text"], answer)]
+            preview = "；".join(n[:40] + ("…" if len(n) > 40 else "") for n in unreferenced[:3])
+            failures.append(
+                f"答案未充分反映表單的補充說明事項（需至少 {required} 則有對應到答案內容，"
+                f"目前只有 {hits} 則；例如：{preview}）。"
+                "請檢視這些補充說明是否與學生情況相關，相關的請適當納入答案（可用自己的話摘要，不需逐字照抄）。"
+            )
 
     if not failures:
         return state  # all checks passed
