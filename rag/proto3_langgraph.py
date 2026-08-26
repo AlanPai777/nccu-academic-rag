@@ -10,6 +10,7 @@ threshold (1262 lines) before this split.
 Graph:
   START → query_decomposition_node ──(not composite)──▶ router_node ──(PROCEDURE)──▶ retrieval_anchor_node ─[Send ×N]─▶ retrieval_expand_node ──▶ office_lookup_node
                                   │                                 ├──(KNOWLEDGE)──────────────────────────────────────────────────────────────▶ retrieval_node ──▶ office_lookup_node
+                                  │                                 ├──(RESOURCE)───────────────────────────────────────────────────────────────▶ resource_node ──▶ office_lookup_node
                                   │                                 ╰──(CONTACT)───────────────────────────────────────────────────────────────────────────────────▶ office_lookup_node
                                   │                                                                                                                                          │
                                   │                                                                                                                                  extraction_node
@@ -47,6 +48,7 @@ from rag.nodes.decomposition import (
 from rag.nodes.routing import router_node
 from rag.nodes.retrieval_procedure import retrieval_anchor_node, _dispatch_expand, retrieval_expand_node
 from rag.nodes.retrieval_knowledge import retrieval_node
+from rag.nodes.retrieval_resource import resource_node
 from rag.nodes.office_lookup import office_lookup_node
 from rag.nodes.extraction import extraction_node
 from rag.nodes.synthesis import synthesis_node
@@ -66,6 +68,8 @@ def _after_router(state: AgentState) -> str:
         return "office_lookup_node"
     if state["query_type"] == QueryType.PROCEDURE:
         return "retrieval_anchor_node"  # Step 4.5: anchor+expand, not retrieval_node
+    if state["query_type"] == QueryType.RESOURCE:
+        return "resource_node"
     return "retrieval_node"  # KNOWLEDGE
 
 
@@ -88,6 +92,7 @@ def build_graph():
     g.add_node("retrieval_anchor_node", retrieval_anchor_node)
     g.add_node("retrieval_expand_node", retrieval_expand_node)
     g.add_node("retrieval_node",       retrieval_node)
+    g.add_node("resource_node",        resource_node)
     g.add_node("office_lookup_node",   office_lookup_node)
     g.add_node("extraction_node",      extraction_node)
     g.add_node("synthesis_node",       synthesis_node)
@@ -101,6 +106,7 @@ def build_graph():
     g.add_conditional_edges("retrieval_anchor_node", _dispatch_expand)
     g.add_edge("retrieval_expand_node", "office_lookup_node")
     g.add_edge("retrieval_node",        "office_lookup_node")
+    g.add_edge("resource_node",         "office_lookup_node")
     g.add_edge("office_lookup_node",    "extraction_node")
     g.add_edge("extraction_node",       "synthesis_node")
     g.add_edge("synthesis_node",        "self_eval_node")

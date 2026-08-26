@@ -31,6 +31,8 @@ def office_lookup_node(state: AgentState) -> AgentState:
                but is no longer this node's primary source.
     CONTACT:   inject offices mentioned in the query; fallback to all if none found.
     KNOWLEDGE: skip — office info not needed for factual queries.
+    RESOURCE:  skip — resource_node already produced the final answer itself
+               (direct form link), doesn't need office contact info either.
 
     OfficeLookupSkill's contact lookup is itself dynamic (condition 4,
     office_contacts_index.jsonl primary, KNOWN_CONTACTS fallback) — this
@@ -40,7 +42,7 @@ def office_lookup_node(state: AgentState) -> AgentState:
 
     qtype = state["query_type"]
 
-    if qtype == QueryType.KNOWLEDGE:
+    if qtype in (QueryType.KNOWLEDGE, QueryType.RESOURCE):
         return {**state, "office_context": "", "office_lookup_result": {}}
 
     if qtype == QueryType.PROCEDURE:

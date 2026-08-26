@@ -8,6 +8,9 @@ Layer 2: LLM fallback — for queries with no clear keyword signal
 QueryType:
   PROCEDURE — multi-step procedure (休學, 復學, 離校...) → ProcedureSkill + moltke priority
   CONTACT   — office contact info (電話, 分機, email, 幾樓) → OfficeLookupSkill
+  RESOURCE  — wants a specific form/document itself, not the whole process
+              (休學申請表在哪裡下載) → resource_node (grep → form → direct link,
+              no multi-step explanation)
   KNOWLEDGE — factual / regulation query (學分上限, 退費比例) → grep + get_page agent loop
 """
 
@@ -20,6 +23,7 @@ from enum import Enum
 class QueryType(str, Enum):
     PROCEDURE = "procedure"
     CONTACT   = "contact"
+    RESOURCE  = "resource"
     KNOWLEDGE = "knowledge"
 
 
@@ -55,6 +59,21 @@ _CONTACT_KEYWORDS = [
     "辦公時間", "上班時間",
 ]
 
+# Wants the artifact itself (a downloadable form), not the process it's part
+# of — distinguishes "休學申請表在哪裡下載" (RESOURCE) from "如何辦理休學"
+# (PROCEDURE), which structurally overlap on "在哪裡"/"下載"-adjacent phrasing
+# with CONTACT's own "在哪裡"/"在哪" keywords. Ties across categories fall
+# through to the LLM layer (see _keyword_route) rather than trying to make
+# the keyword layer perfectly disambiguate every case — same "keyword first,
+# LLM only when ambiguous" principle already used for PROCEDURE vs CONTACT.
+_RESOURCE_KEYWORDS = [
+    "在哪裡下載", "去哪裡下載", "哪裡下載", "在哪下載", "去哪下載",
+    "在哪裡拿", "去哪裡拿", "哪裡拿",
+    "在哪裡領", "去哪裡領", "哪裡領",
+    "在哪裡索取", "哪裡索取",
+    "下載連結", "下載點", "下載",
+]
+
 # KNOWLEDGE is the default — no keyword list needed
 
 
@@ -72,32 +91,38 @@ def _dedupe_substring_matches(matched: list[str]) -> list[str]:
 def _keyword_route(query: str) -> QueryType | None:
     """
     Return QueryType if keyword signal is clear; None if ambiguous.
-    Ties (both procedure + contact hit) → None, let LLM decide.
+    Ties (2+ categories with the same top hit count) → None, let LLM decide.
     """
     q = query  # keep original case for Chinese matching
 
     proc_matched = _dedupe_substring_matches([kw for kw in _PROCEDURE_KEYWORDS if kw in q])
     cont_matched = _dedupe_substring_matches([kw for kw in _CONTACT_KEYWORDS   if kw in q])
-    proc_hits = len(proc_matched)
-    cont_hits = len(cont_matched)
-
-    if proc_hits > 0 and proc_hits > cont_hits:
-        return QueryType.PROCEDURE
-    if cont_hits > 0 and cont_hits > proc_hits:
-        return QueryType.CONTACT
-    return None  # ambiguous
+    res_matched  = _dedupe_substring_matches([kw for kw in _RESOURCE_KEYWORDS if kw in q])
+    hits = {
+        QueryType.PROCEDURE: len(proc_matched),
+        QueryType.CONTACT:   len(cont_matched),
+        QueryType.RESOURCE:  len(res_matched),
+    }
+    best_type, best_hits = max(hits.items(), key=lambda kv: kv[1])
+    if best_hits == 0:
+        return None  # no signal at all — ambiguous
+    if list(hits.values()).count(best_hits) > 1:
+        return None  # tie between 2+ categories — ambiguous
+    return best_type
 
 
 # ── Layer 2: LLM fallback ────────────────────────────────────────────────────
 
 _LLM_SYSTEM = "你是 NCCU 學術事務 Q&A 系統的 query router，只回傳一個詞。"
 
-_LLM_USER = """將以下問題分類為三種類型之一：
-- procedure：需要辦理流程（如休學、復學、退學、申請表格、離校手續）
+_LLM_USER = """將以下問題分類為四種類型之一：
+- procedure：需要完整辦理流程說明（如休學、復學、退學怎麼辦、要跑哪些手續）
 - contact：詢問聯絡資訊（電話、分機、email、地址、樓層、辦公時間）
+- resource：只是想要一份特定表單/文件本身（下載連結、去哪裡拿），不是要問完整辦理流程
+           （例如「休學申請表在哪裡下載」是 resource，「如何辦理休學」是 procedure）
 - knowledge：詢問法規、政策、事實（學分上限、退費比例、畢業條件等）
 
-只回傳一個詞：procedure / contact / knowledge
+只回傳一個詞：procedure / contact / resource / knowledge
 
 問題：{query}"""
 
@@ -112,6 +137,8 @@ def _llm_route(query: str) -> QueryType:
         max_tokens=10,
     )
     text = (content or "").strip().lower()
+    if "resource" in text:
+        return QueryType.RESOURCE
     if "procedure" in text:
         return QueryType.PROCEDURE
     if "contact" in text:
@@ -154,6 +181,10 @@ if __name__ == "__main__":
         ("住宿組在幾樓",         QueryType.CONTACT),
         ("生僑組 email",         QueryType.CONTACT),
         ("國合處聯絡方式",       QueryType.CONTACT),
+        # Expected: RESOURCE
+        ("休學申請表在哪裡下載", QueryType.RESOURCE),
+        ("退學申請書下載連結",   QueryType.RESOURCE),
+        ("復學表格去哪裡拿",     QueryType.RESOURCE),
         # Expected: KNOWLEDGE
         ("選課最多可以修幾學分", QueryType.KNOWLEDGE),
         ("退費比例是多少",       QueryType.KNOWLEDGE),

@@ -39,10 +39,18 @@ def synthesis_node(state: AgentState) -> AgentState:
     Generate the final answer from retrieved context + office contact info.
 
     KNOWLEDGE: answer already produced by agent loop → pass through.
+    RESOURCE:  answer already produced by resource_node → pass through, NO
+               parametric fallback (unlike KNOWLEDGE) — a hallucinated form
+               URL/ID is a much worse failure than resource_node's own
+               honest "查無此表單" decline, so this branch never calls
+               _parametric_fallback regardless of context_pages/answer state.
     PROCEDURE / CONTACT: call LLM with context_pages + office_context +
     extraction_checklist (condition 6).
     On E4 retry: prepends correction_hint so the LLM knows what to fix.
     """
+    if state["query_type"] == QueryType.RESOURCE:
+        return state
+
     if state["query_type"] == QueryType.KNOWLEDGE:
         answer = state.get("answer", "")
         # E7: agent loop found nothing → parametric fallback
