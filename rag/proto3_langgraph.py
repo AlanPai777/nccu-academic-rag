@@ -367,6 +367,7 @@ def retrieval_node(state: AgentState) -> AgentState:
     # E5 Doom Loop Detector constants
     _MAX_TURNS      = 10   # hard cap on LLM turns
     _MAX_STUCK      = 3    # exit if all tool calls are duplicates for this many consecutive turns
+    _TOOL_SAMPLE_N  = 3    # condition 8-A: turn-1 majority-vote resample count
 
     # Step 5 (condition 5): Domain Router picks the subdomain hint the LLM's
     # step-1 grep_texts call is guided towards, replacing the hardcoded
@@ -389,6 +390,37 @@ def retrieval_node(state: AgentState) -> AgentState:
             tools=_TOOLS,
             system_prompt=agent_system,
         )
+
+        # Condition 8-A (Step 6): turn-1 "no tool call" is the observed E7
+        # parametric-fallback failure mode (CLAUDE.md "KNOWLEDGE path
+        # instability" — model answers from training knowledge instead of
+        # retrieving). Resample up to _TOOL_SAMPLE_N-1 more times and
+        # majority-vote "should a tool have been called" — this only pays
+        # the extra LLM-call cost when the default single shot already
+        # looks like a fallback, not on every turn or every query.
+        if turn == 0 and not tool_calls:
+            tool_votes = 0
+            fallback_votes = 1  # the original sample voted "no tool"
+            candidate = None
+            for _ in range(_TOOL_SAMPLE_N - 1):
+                c2, tc2 = chat_with_tools(
+                    messages=messages,
+                    tools=_TOOLS,
+                    system_prompt=agent_system,
+                )
+                if tc2:
+                    tool_votes += 1
+                    candidate = candidate or (c2, tc2)
+                else:
+                    fallback_votes += 1
+            if tool_votes > fallback_votes and candidate is not None:
+                print(
+                    f"[tool-sample] turn 1: {tool_votes}/{_TOOL_SAMPLE_N} samples chose to "
+                    f"call a tool — overriding default no-tool answer",
+                    file=sys.stderr,
+                )
+                content, tool_calls = candidate
+
         if not tool_calls:
             last_answer = content or last_answer
             break
