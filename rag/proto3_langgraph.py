@@ -63,6 +63,12 @@ class AgentState(TypedDict):
     _anchor_form_ids:     list[str]  # Step 4.5: form IDs found in anchor content
     expand_target:        dict       # Step 4.5: per-Send-branch payload {"kind","value"}
     office_context:       str        # formatted contact info — E3: OfficeLookupSkill
+    office_lookup_result: dict       # raw {office: {contacts: [...], ...}} from
+                                      # OfficeLookupSkill.run() — kept structured
+                                      # (not just the flattened office_context
+                                      # string) so extraction_node can build a
+                                      # per-office checklist without regex
+                                      # re-parsing already-formatted text
     extraction_checklist: dict       # condition 6: pre-synthesis dynamic checklist
     answer:               str        # final answer
     correction_hint:      str        # E4: self-eval feedback for synthesis retry
@@ -296,7 +302,10 @@ def merge_node(state: AgentState) -> AgentState:
         "context_pages":        merged_context_pages,
         "sources":              list(dict.fromkeys(merged_sources)),
         "office_context":       "\n\n".join(office_sections),
-        "extraction_checklist": {"person_names": merged_person_names, "forms": merged_forms},
+        "extraction_checklist": {
+            "person_names": merged_person_names,
+            "forms":        merged_forms,
+        },
         # Composite answers always go through the full prompt-based synthesis
         # (office_section + checklist), never the KNOWLEDGE pass-through —
         # needed to weave multiple sub-topics into one coherent answer even
@@ -616,7 +625,7 @@ def office_lookup_node(state: AgentState) -> AgentState:
     qtype = state["query_type"]
 
     if qtype == QueryType.KNOWLEDGE:
-        return {**state, "office_context": ""}
+        return {**state, "office_context": "", "office_lookup_result": {}}
 
     if qtype == QueryType.PROCEDURE:
         offices = _offices_from_context(state.get("context_pages", [])) or _PROCEDURE_OFFICES
@@ -625,13 +634,11 @@ def office_lookup_node(state: AgentState) -> AgentState:
 
     skill  = OfficeLookupSkill()
     result = skill.run(offices)
-    return {**state, "office_context": skill.format_context(result)}
-
-
-# ── Condition 6: pre-synthesis dynamic checklist ─────────────────────────────
-# Matches OfficeLookupSkill.format_context()'s per-contact line format exactly:
-# "    • {name}（{duty}）分機 {ext}" (see rag/skills/office_lookup_skill.py).
-_PERSON_LINE_RE = re.compile(r'•\s*([^\s（]+)（([^）]*)）分機\s*(\d{4,5})')
+    return {
+        **state,
+        "office_context":       skill.format_context(result),
+        "office_lookup_result": result,
+    }
 
 
 def extraction_node(state: AgentState) -> AgentState:
@@ -639,9 +646,14 @@ def extraction_node(state: AgentState) -> AgentState:
     Condition 6: build a fact checklist from what retrieval/office_lookup
     actually found, BEFORE synthesis — v1 is pure regex, zero extra LLM calls.
 
-    person_names: parsed from office_context's structured "• 姓名（職責）分機
-                   XXXXX" lines (not hardcoded — reflects whichever offices
-                   this specific query actually pulled in).
+    person_names: built directly from office_lookup_result's structured
+                   {office: {contacts: [{name, duty, ext, email}, ...]}} —
+                   reading OfficeLookupSkill's own per-office contact lists,
+                   not regex re-parsing the flattened office_context string
+                   (was `_PERSON_LINE_RE` matching "• 姓名（職責）分機 XXXXX"
+                   lines — worked but was a fragile round-trip through
+                   already-formatted text; office_lookup_result carries the
+                   same data structured, so this reads it directly instead).
     forms:        form IDs parsed from context_pages text via agent_tools.extract_form_ids()
                    (reused, not reimplemented), each paired with its title when
                    the form's own page is in context_pages — lets the LLM judge
@@ -655,8 +667,12 @@ def extraction_node(state: AgentState) -> AgentState:
     fabricated a 教務長 approval layer that doesn't exist in QP-T01-03-04).
     """
     person_names: list[dict] = []
-    for name, duty, ext in _PERSON_LINE_RE.findall(state.get("office_context", "")):
-        person_names.append({"name": name, "duty": duty, "ext": ext})
+    for office, info in state.get("office_lookup_result", {}).items():
+        for c in info.get("contacts", []):
+            name, duty, ext = c.get("name", ""), c.get("duty", ""), c.get("ext", "")
+            if not name or not ext:
+                continue
+            person_names.append({"name": name, "duty": duty, "ext": ext})
 
     context_pages = state.get("context_pages", [])
 
@@ -731,8 +747,31 @@ def synthesis_node(state: AgentState) -> AgentState:
             return {**state, "answer": _parametric_fallback(state["query"])}
         return state
 
+    # Dedup by URL before rendering. context_pages can carry the same page
+    # multiple times — confirmed 2026-08-26 that neither retrieval_anchor_node
+    # nor any single retrieval_expand_node branch is called more than once
+    # (traced with a per-call print), so the duplication happens somewhere in
+    # how LangGraph's operator.add reducer applies Send-branch writes, not in
+    # our own node logic (root cause not fully diagnosed — deep LangGraph
+    # internals, out of scope to chase further right now). Observed
+    # multiplying an 18-page anchor+expand result into 68 entries (14 unique)
+    # even before any self_eval retry, and self_eval_node's retry loop
+    # doubles it again each retry, which is what actually blew past the
+    # model's 262K-token context limit today. Deduping here is a pragmatic,
+    # correctness-preserving fix at the consumption point — safe no-op if
+    # duplication is ever fixed upstream, and doesn't depend on diagnosing
+    # the exact LangGraph mechanism.
+    seen_page_urls: set[str] = set()
+    deduped_pages = []
+    for page in state.get("context_pages", []):
+        url = page.get("url", "")
+        if url in seen_page_urls:
+            continue
+        seen_page_urls.add(url)
+        deduped_pages.append(page)
+
     context_parts = []
-    for i, page in enumerate(state.get("context_pages", []), 1):
+    for i, page in enumerate(deduped_pages, 1):
         header = f"[文件 {i}] {page.get('title', '')}  來源：{page.get('url', '')}"
         body   = page.get("text", "")[:3000]
         context_parts.append(f"{header}\n{body}")
@@ -822,6 +861,23 @@ def self_eval_node(state: AgentState) -> AgentState:
                 f"答案缺少承辦人姓名（需 ≥{required} 位，checklist 中找到：{'、'.join(checklist_names)}）。"
                 "請在每個步驟列出對應承辦人姓名（從【各辦公室聯絡資訊】引用）。"
             )
+
+    # 2026-08-26: tried a dynamic check here — "does the answer show
+    # multiple review layers for offices whose real contact roster has 2+
+    # distinct job titles" — as a generalization of eval.py's static
+    # nine_stamps criterion. Reverted: distinct-duty-count in
+    # OfficeLookupSkill's contact roster measures staffing diversity (how
+    # many different job titles an office happens to employ — 住宿組 has 13,
+    # purely from having lots of staff with different day-to-day jobs), not
+    # documented approval-chain depth. That's the wrong data source — it
+    # would force 2+ named contacts onto offices that don't need them,
+    # recreating the original roster-bloat bug for offices other than the
+    # one it was meant to fix. The right signal (whether the PROCEDURE
+    # ITSELF documents multiple approval sub-stages for a step — e.g.
+    # QP-T01-03-02's table literally splits 教務處's row into 組長 and
+    # 教務長 sub-cells) lives in context_pages' table structure, not in the
+    # office contact roster; extracting that is a separate, harder task,
+    # not done yet. See phase_f_planning_report.md Gotchas.
 
     if not failures:
         return state  # all checks passed
@@ -952,6 +1008,7 @@ def run(query: str) -> str:
         "_anchor_form_ids":     [],
         "expand_target":        {},
         "office_context":       "",
+        "office_lookup_result": {},
         "extraction_checklist": {},
         "answer":               "",
         "correction_hint":      "",
