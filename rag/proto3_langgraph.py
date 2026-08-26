@@ -8,7 +8,7 @@ Graph:
                                   │                                 ╰──(CONTACT)───────────────────────────────────────────────────────────────────────────────────▶ office_lookup_node
                                   │                                                                                                                                          │
                                   │                                                                                                                                  extraction_node
-                                  ╰──(composite)──▶ merge_node (v1: sequential loop over sub_queries, still ProcedureSkill-based — TODO: Send + anchor/expand) ─────────────╯
+                                  ╰──(composite)──▶ sub_query_node [Send ×N, one per sub_query] ──▶ merge_node (flatten+dedupe; each branch still uses retrieval_node/ProcedureSkill internally, not anchor+expand — known follow-up) ─╯
                                                                                                                                                                               │
                                                                                                                                                                       synthesis_node ◀─╮
                                                                                                                                                                               │         │ correction_hint set
@@ -57,6 +57,16 @@ class AgentState(TypedDict):
     # it per graph run, always starting from the [] set in run()'s initial state.
     context_pages:        Annotated[list[dict], operator.add]
     sources:               Annotated[list[str], operator.add]
+    # Step 2.5 Send upgrade: each sub_query_node Send-branch appends ONE dict
+    # ({"office_context", "extraction_checklist"}) for its own sub_query —
+    # office_context/extraction_checklist themselves have no sane
+    # operator.add semantics (str concatenation / dict merging aren't safe
+    # across N concurrent branches), so the raw per-branch results are
+    # collected here instead and flattened/deduped by merge_node after all
+    # branches converge, same division of labor context_pages/sources
+    # already have via their own reducer.
+    sub_query_results:    Annotated[list[dict], operator.add]
+    _sub_query:           str  # Step 2.5 Send upgrade: this branch's one sub_query text
     detected_offices:     list[str]  # Step 4.5: set by retrieval_anchor_node so
                                       # office_lookup_node doesn't re-detect (condition 3)
     _anchor_links:        list[str]  # Step 4.5: cross-domain links found in anchor content
@@ -238,29 +248,78 @@ def query_decomposition_node(state: AgentState) -> AgentState:
     return {**state, "sub_queries": clauses}
 
 
-def merge_node(state: AgentState) -> AgentState:
+def sub_query_node(state: AgentState) -> AgentState:
     """
-    Step 2.5: process each sub_query and merge results at the DATA layer
-    only (context_pages / office_context / extraction_checklist) — never
-    merges generated text, to avoid fragmented answers and multiplying LLM
-    calls. One synthesis_node call handles the merged data for the whole
-    composite query, same as a single query would.
+    Step 2.5 Send upgrade: processes ONE sub_query from a composite query —
+    a Send-branch target dispatched by _dispatch_sub_queries, one branch per
+    sub_query, running in parallel. Must return ONLY the fields it updates
+    (context_pages / sources / sub_query_results), never a full {**state,
+    ...} merge — same rule retrieval_expand_node already follows, since N
+    branches write concurrently within one LangGraph superstep.
 
-    v1 is a plain sequential loop (established TODO, do not let this quietly
-    become permanent): upgrade to Send-based parallel dispatch by replacing
-    just this for-loop — the merge logic below already operates on
-    independent per-sub-query results, so it is unaffected by whether the
-    loop runs sequentially or via Send.
-
-    Reuses retrieval_node / office_lookup_node / extraction_node as plain
-    function calls against an isolated per-sub-query state (not through
-    graph routing) — same node functions the single-query path uses,
-    not reimplemented. retrieval_node is skipped for CONTACT sub-queries,
+    Body is unchanged from merge_node's old per-sub_query loop iteration:
+    route() → retrieval_node/office_lookup_node/extraction_node as plain
+    function calls against an isolated sub_state (not through graph
+    routing) — same node functions the single-query path uses, not
+    reimplemented. retrieval_node is skipped for CONTACT sub-queries,
     matching _after_router's routing behaviour (retrieval_node's KNOWLEDGE
     branch would otherwise run for CONTACT, which it was never designed for).
     """
-    merged_context_pages: list[dict] = []
-    merged_sources: list[str] = []
+    sub_query = state["_sub_query"]
+    result = route(sub_query)
+    sub_state: AgentState = {
+        **state,
+        "query":                sub_query,
+        "query_type":           result.query_type.value,
+        "route_method":         result.method,
+        "context_pages":        [],
+        "office_context":       "",
+        "extraction_checklist": {},
+        "sources":              [],
+    }
+
+    if result.query_type in (QueryType.PROCEDURE, QueryType.KNOWLEDGE):
+        sub_state = retrieval_node(sub_state)
+
+    sub_state = office_lookup_node(sub_state)
+    sub_state = extraction_node(sub_state)
+
+    return {
+        "context_pages": sub_state.get("context_pages", []),
+        "sources":       sub_state.get("sources", []),
+        "sub_query_results": [{
+            "office_context":       sub_state.get("office_context", ""),
+            "extraction_checklist": sub_state.get("extraction_checklist", {}),
+        }],
+    }
+
+
+def _dispatch_sub_queries(state: AgentState) -> list[Send]:
+    """
+    Conditional-edge routing function: one Send per sub_query, mirroring
+    _dispatch_expand's pattern (Step 4.5) — N determined by how many
+    sub_queries query_decomposition_node actually found, not fixed.
+    _after_decomposition only calls this when sub_queries is non-empty, so
+    no empty-list fallback is needed here (unlike _dispatch_expand).
+    """
+    return [
+        Send("sub_query_node", {**state, "_sub_query": sub_query})
+        for sub_query in state["sub_queries"]
+    ]
+
+
+def merge_node(state: AgentState) -> AgentState:
+    """
+    Step 2.5: convergence point after all sub_query_node Send-branches
+    complete. context_pages/sources are already fully merged by their own
+    operator.add reducers by the time this runs (same mechanism
+    retrieval_expand_node's branches rely on) — this function only flattens
+    and dedupes the per-sub_query office_context/extraction_checklist
+    fragments collected in sub_query_results, since those two fields aren't
+    reducer-safe (see AgentState's sub_query_results docstring). Never
+    merges generated text — one synthesis_node call handles the merged data
+    for the whole composite query, same as a single query would.
+    """
     office_sections: list[str] = []
     merged_person_names: list[dict] = []
     merged_forms: list[dict] = []
@@ -268,31 +327,11 @@ def merge_node(state: AgentState) -> AgentState:
     seen_form_ids: set[str] = set()
     seen_notes: set[str] = set()
 
-    for sub_query in state["sub_queries"]:
-        result = route(sub_query)
-        sub_state: AgentState = {
-            **state,
-            "query":                sub_query,
-            "query_type":           result.query_type.value,
-            "route_method":         result.method,
-            "context_pages":        [],
-            "office_context":       "",
-            "extraction_checklist": {},
-            "sources":              [],
-        }
+    for r in state.get("sub_query_results", []):
+        if r.get("office_context"):
+            office_sections.append(r["office_context"])
 
-        if result.query_type in (QueryType.PROCEDURE, QueryType.KNOWLEDGE):
-            sub_state = retrieval_node(sub_state)
-
-        sub_state = office_lookup_node(sub_state)
-        sub_state = extraction_node(sub_state)
-
-        merged_context_pages.extend(sub_state.get("context_pages", []))
-        merged_sources.extend(sub_state.get("sources", []))
-        if sub_state.get("office_context"):
-            office_sections.append(sub_state["office_context"])
-
-        checklist = sub_state.get("extraction_checklist", {})
+        checklist = r.get("extraction_checklist", {})
         merged_person_names.extend(checklist.get("person_names", []))
         for f in checklist.get("forms", []):
             if f["id"] not in seen_form_ids:
@@ -305,8 +344,7 @@ def merge_node(state: AgentState) -> AgentState:
 
     return {
         **state,
-        "context_pages":        merged_context_pages,
-        "sources":              list(dict.fromkeys(merged_sources)),
+        "sources":               list(dict.fromkeys(state.get("sources", []))),
         "office_context":       "\n\n".join(office_sections),
         "extraction_checklist": {
             "person_names": merged_person_names,
@@ -1116,9 +1154,9 @@ def self_eval_node(state: AgentState) -> AgentState:
 
 # ── Conditional routing ───────────────────────────────────────────────────────
 
-def _after_decomposition(state: AgentState) -> str:
+def _after_decomposition(state: AgentState) -> str | list[Send]:
     if state.get("sub_queries"):
-        return "merge_node"
+        return _dispatch_sub_queries(state)
     return "router_node"
 
 
@@ -1188,6 +1226,7 @@ def build_graph():
     g = StateGraph(AgentState)
 
     g.add_node("query_decomposition_node", query_decomposition_node)
+    g.add_node("sub_query_node",       sub_query_node)
     g.add_node("merge_node",           merge_node)
     g.add_node("router_node",          router_node)
     g.add_node("retrieval_anchor_node", retrieval_anchor_node)
@@ -1200,6 +1239,7 @@ def build_graph():
 
     g.add_edge(START, "query_decomposition_node")
     g.add_conditional_edges("query_decomposition_node", _after_decomposition)
+    g.add_edge("sub_query_node",        "merge_node")
     g.add_edge("merge_node",            "synthesis_node")
     g.add_conditional_edges("router_node", _after_router)
     g.add_conditional_edges("retrieval_anchor_node", _dispatch_expand)
@@ -1226,6 +1266,8 @@ def run(query: str) -> str:
         "query_type":           "",
         "route_method":         "",
         "sub_queries":          [],
+        "sub_query_results":    [],
+        "_sub_query":           "",
         "context_pages":        [],
         "sources":              [],
         "detected_offices":     [],
