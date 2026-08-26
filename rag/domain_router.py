@@ -153,6 +153,28 @@ def layer2_candidates(query: str, top_k: int = 200) -> list[tuple[str, int]]:
     return sorted(agg.items(), key=lambda kv: -kv[1])
 
 
+def is_ambiguous(query: str, ratio_threshold: float = 0.6) -> bool:
+    """
+    Step 6 condition 8-C: cheap signal for "is this query's routing shaky
+    enough to be worth an extra Router-as-judge semantic check". Layer 1
+    hits are exact office-name matches — never ambiguous by this
+    definition. Layer 2 is ambiguous when the #2 subdomain's hit count is
+    within ratio_threshold of #1's — the same "large/diffuse subdomain
+    might out-vote a small/precise one" risk this module's docstring
+    already flags as real-but-untested (confirmed real for "如何辦理復學":
+    aca vs osa) lives here. Deliberately loose/inclusive (0.6, not tuned):
+    a false positive only costs one extra LLM call in self_eval_node, a
+    false negative silently ships an unguarded off-topic answer — the
+    asymmetry favors erring toward "ambiguous".
+    """
+    if _layer1_match(query):
+        return False
+    candidates = layer2_candidates(query)
+    if len(candidates) < 2 or candidates[0][1] == 0:
+        return False
+    return (candidates[1][1] / candidates[0][1]) >= ratio_threshold
+
+
 def route_domain(query: str) -> str | None:
     """
     Layer 1 -> Layer 2 -> None. None means neither layer found anything —

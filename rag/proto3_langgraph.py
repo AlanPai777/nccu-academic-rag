@@ -37,7 +37,7 @@ from langgraph.types import Send
 from rag.router import route, QueryType, _keyword_route
 from rag.llm_client import chat_with_tools, simple_chat, get_active_model, PROVIDER
 from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form, extract_form_ids
-from rag.domain_router import route_domain
+from rag.domain_router import route_domain, is_ambiguous
 from rag.skills.procedure_skill import ProcedureSkill, _extract_keyword
 from rag.eval import print_score_report
 
@@ -952,6 +952,46 @@ def _note_referenced(note: str, answer: str, threshold: float = 0.4) -> bool:
     return len(note_bg & answer_bg) / len(note_bg) >= threshold
 
 
+# ── Condition 8-C (Step 6): Router-as-judge semantic check ──────────────────
+# Standalone helper, NOT yet wired into self_eval_node's retry loop — keyword
+# checks (_SELF_EVAL_CRITERIA below) can only verify certain strings appear,
+# they structurally cannot catch "format right, content off-topic" answers
+# (e.g. Domain Router's osa-dilution finding: a 復學 answer that's actually
+# mostly about dorm eligibility, but still contains "復學" and step-list
+# formatting so every keyword check passes). Known weakness from literature
+# (Zheng et al. 2023, MT-Bench "LLM-as-judge"): the judge itself can be
+# wrong or format-sensitive — validated here against curated known-good/
+# known-bad examples BEFORE deciding whether to wire it into the live retry
+# loop, not assumed reliable by default.
+_ROUTER_JUDGE_SYSTEM = "你是 NCCU 學術事務 Q&A 系統的品質判官，只根據語意判斷答案內容是否真的回答了問題，不看格式對不對。"
+
+_ROUTER_JUDGE_USER = """學生問題：{query}
+
+系統答案：
+{answer}
+
+請判斷：這個答案的內容是否真的針對「{query}」這個問題本身作答？特別留意「格式正確、關鍵字也對，但內容其實主要在講別的主題」這種情況——例如答案主要在介紹某個不相關的規定或活動，只是剛好提到問題裡的關鍵字或表面相關。
+
+只回傳一個 JSON，不要有其他文字：{{"verdict": "PASS 或 FAIL", "reason": "一句話原因"}}"""
+
+
+def _router_judge(query: str, answer: str) -> dict:
+    """Send (query, answer) to the LLM for a semantic PASS/FAIL judgment."""
+    raw = simple_chat(
+        messages=[
+            {"role": "system", "content": _ROUTER_JUDGE_SYSTEM},
+            {"role": "user",   "content": _ROUTER_JUDGE_USER.format(query=query, answer=answer)},
+        ],
+        max_tokens=200,
+    )
+    try:
+        start = raw.index("{")
+        end   = raw.rindex("}") + 1
+        return json.loads(raw[start:end])
+    except (ValueError, json.JSONDecodeError):
+        return {"verdict": "ERROR", "reason": raw[:200]}
+
+
 _SELF_EVAL_CRITERIA = [
     {
         "name":     "sources",
@@ -1042,6 +1082,26 @@ def self_eval_node(state: AgentState) -> AgentState:
                 f"答案未充分反映表單的補充說明事項（需至少 {required} 則有對應到答案內容，"
                 f"目前只有 {hits} 則；例如：{preview}）。"
                 "請檢視這些補充說明是否與學生情況相關，相關的請適當納入答案（可用自己的話摘要，不需逐字照抄）。"
+            )
+
+    # Condition 8-C (Step 6): Router-as-judge, gated on domain_router's
+    # is_ambiguous() so the extra LLM call only happens on queries where
+    # routing was shaky to begin with (e.g. "如何辦理復學" — the real
+    # osa-dilution case this was built for), not on every PROCEDURE answer.
+    # On FAIL, the correction explicitly asks for an honest decline rather
+    # than "try again" — re-synthesizing from the SAME context_pages can't
+    # fix a wrong-subdomain retrieval, so asking for a rewrite would just
+    # produce another confidently-off-topic answer. This is a stopgap, not
+    # a fix for the underlying routing gap — see phase_f_planning_report.md
+    # (Step 5's risk 2 / future Layer 3 CRAG-lite retry is the real fix).
+    if is_ambiguous(state["query"]):
+        judge = _router_judge(state["query"], answer)
+        print(f"[router-judge] {judge.get('verdict')}: {judge.get('reason', '')}", file=sys.stderr)
+        if judge.get("verdict") == "FAIL":
+            failures.append(
+                f"Router-as-judge 判定答案可能離題（{judge.get('reason', '')}）。"
+                "若上方【搜尋到的頁面內容】明顯與問題主題不符，請不要勉強套用不相關的資料組出答案，"
+                "改為誠實回答「資料不足以確認」並說明需要進一步查證。"
             )
 
     if not failures:
