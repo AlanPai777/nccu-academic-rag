@@ -29,6 +29,22 @@ ROOT = Path(__file__).parent.parent
 CHUNKS_PATH = ROOT / "rag" / "chunks.jsonl"
 DEFAULT_DB_PATH = Path(__file__).parent / "fts.db"
 
+# NCCU domain-vocabulary compounds jieba's default dictionary mis-segments
+# (Phase F, 2026-08-26 — found via Domain Router's "如何辦理復學" misrouting
+# to osa instead of aca: jieba split "復學" into "復"+"學", and "學" alone
+# is common enough corpus-wide that it diluted Layer 2's count aggregation).
+# Loaded once at import time so index-build and query-time segmentation
+# (both call _segment() below) stay consistent — an index built before this
+# was loaded would still have the old "復"+"學" tokens, so any FTS5 index
+# built before this file existed must be rebuilt for the fix to take effect.
+# Every entry here was individually confirmed mis-segmented before adding
+# (see git history / phase_f_planning_report.md) — this is not a guessed
+# list, and is not claimed to be exhaustive; other NCCU-specific compounds
+# not tested yet may still mis-segment.
+_USERDICT_PATH = Path(__file__).parent / "jieba_userdict.txt"
+if _USERDICT_PATH.exists():
+    jieba.load_userdict(str(_USERDICT_PATH))
+
 
 def _segment(text: str) -> str:
     """Segment text using jieba for Chinese word matching in FTS5."""
