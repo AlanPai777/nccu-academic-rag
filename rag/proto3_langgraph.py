@@ -37,6 +37,7 @@ from langgraph.types import Send
 from rag.router import route, QueryType, _keyword_route
 from rag.llm_client import chat_with_tools, simple_chat, get_active_model, PROVIDER
 from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form, extract_form_ids
+from rag.domain_router import route_domain
 from rag.skills.procedure_skill import ProcedureSkill, _extract_keyword
 from rag.eval import print_score_report
 
@@ -151,11 +152,11 @@ _AGENT_SYSTEM = """你是國立政治大學（政大）的學務助理，使用�
 6. 回答最後以「【引用來源】」列出所有使用到的 URL
 
 【工具使用策略】
-步驟一：grep_texts("關鍵字", subdomain="aca") 找主頁
+步驟一：grep_texts("關鍵字", subdomain="{subdomain_hint}") 找主頁——{subdomain_hint} 是系統依問題內容預先判斷的最可能子網域，找不到結果時再改用不指定 subdomain 的全域搜尋
 步驟二：get_page(主頁 URL) 取完整內文
 步驟三：extract_links(主頁 URL) 取所有 NCCU 跨處室連結
 步驟四：get_page(退費頁 URL) 取退費標準
-步驟五：get_form("QP-T01-03-02") 取蓋章流程與樓層
+步驟五：若內文提到官方表單編號（格式如 QP-xxx-xx-xx），用 get_form(表單編號) 取蓋章流程與樓層
 
 ⚠️ 絕對不可自行猜測 URL。跨處室連結必須透過 extract_links 取得後再 get_page。
 """
@@ -351,6 +352,14 @@ def retrieval_node(state: AgentState) -> AgentState:
     _MAX_TURNS      = 10   # hard cap on LLM turns
     _MAX_STUCK      = 3    # exit if all tool calls are duplicates for this many consecutive turns
 
+    # Step 5 (condition 5): Domain Router picks the subdomain hint the LLM's
+    # step-1 grep_texts call is guided towards, replacing the hardcoded
+    # "aca" every KNOWLEDGE query used to get regardless of topic. The LLM
+    # is still free to ignore the hint or search unscoped — this only
+    # changes the example in the prompt, not a hard constraint.
+    subdomain_hint = route_domain(query) or "aca"
+    agent_system = _AGENT_SYSTEM.format(subdomain_hint=subdomain_hint)
+
     messages: list[dict] = [{"role": "user", "content": query}]
     seen_calls: list[str] = []
     last_answer = ""
@@ -362,7 +371,7 @@ def retrieval_node(state: AgentState) -> AgentState:
         content, tool_calls = chat_with_tools(
             messages=messages,
             tools=_TOOLS,
-            system_prompt=_AGENT_SYSTEM,
+            system_prompt=agent_system,
         )
         if not tool_calls:
             last_answer = content or last_answer
@@ -484,7 +493,11 @@ def retrieval_anchor_node(state: AgentState) -> AgentState:
     query = state["query"]
     keyword = _extract_keyword(query)
 
-    main_results = grep_texts(keyword, subdomain="aca", max_results=5)
+    # Step 5 (condition 5): Domain Router replaces the hardcoded aca-first
+    # bias — falls back to "aca" only if Domain Router itself finds nothing
+    # (Layer 1 + Layer 2 both empty), not as a silent default otherwise.
+    subdomain = route_domain(query) or "aca"
+    main_results = grep_texts(keyword, subdomain=subdomain, max_results=5)
     if not main_results:
         main_results = grep_texts(keyword, max_results=5)
 

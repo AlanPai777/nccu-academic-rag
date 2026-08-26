@@ -15,6 +15,7 @@ from rag.agent_tools import (
     grep_texts, get_page, extract_links,
     get_children, get_form, extract_form_ids
 )
+from rag.domain_router import route_domain
 
 # Strip question-phrasing words to get the core topic noun for grep
 _STRIP_RE = re.compile(
@@ -42,9 +43,12 @@ class ProcedureSkill:
 
         # Step 1: Find main relevant pages (top-3)
         # Use stripped keyword so "如何辦理休學" → grep "休學"
-        # Search aca first (primary domain for academic procedures); fallback to all
+        # Step 5 (condition 5): Domain Router picks the subdomain instead of
+        # a hardcoded aca-first guess; falls back to aca, then to an
+        # unscoped global search, if Domain Router finds nothing.
         keyword = _extract_keyword(query)
-        main_results = grep_texts(keyword, subdomain='aca', max_results=5)
+        subdomain = route_domain(query) or "aca"
+        main_results = grep_texts(keyword, subdomain=subdomain, max_results=5)
         if not main_results:
             main_results = grep_texts(keyword, max_results=5)
         if not main_results:
