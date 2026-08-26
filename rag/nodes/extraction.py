@@ -13,6 +13,7 @@ import re
 import sys
 
 from rag.agent_tools import extract_form_ids
+from rag.agent_runtime import _ALL_OFFICE_NAMES
 from rag.nodes.state import AgentState
 
 # Matches the numbering conventions Chinese-language forms use for
@@ -58,6 +59,99 @@ def _extract_candidate_notes(text: str) -> list[str]:
             if item:
                 notes.append(item)
     return notes
+
+
+# ── Structural checklist: form table → required stations (2026-08-26) ───────
+# Generalizes eval.py's static nine_stamps/office_locations criteria (which
+# hardcode 休學's 7-station chain into the synthesis prompt) into a
+# dynamically-extracted checklist item, using the moltke form's OWN table
+# structure instead of a procedure-specific rule. This is the "right signal"
+# a reverted earlier attempt (office_role_diversity, see self_eval_node's
+# comments) went looking for but used the wrong data source for — the real
+# signal lives here, in the form table's own numbered-station markers, not
+# in the office contact roster's job-title diversity.
+#
+# Matches both full-width（）and half-width() parens, and mixed pairs like
+# "(7）" — confirmed present in real form text (QP-T01-03-02/QP-T01-03-05
+# both mix conventions within the same table). Requires a digit directly
+# inside the parens so it doesn't collide with _NOTE_MARKER_RE's "1、"-style
+# markers (different syntax, already handled separately) or unrelated
+# parenthetical text like "(未成年學生須經法定代理人簽章同意。)".
+_STATION_MARKER_RE = re.compile(r'[（(]\s*(\d{1,2})\s*[）)]\s*([^\s|（(]{1,20})')
+
+
+def _extract_stations(text: str) -> list[dict]:
+    """
+    Find numbered station markers (e.g. "（1）系所簽章") in one page's text,
+    return [{"step": 1, "label": "系所簽章"}, ...] sorted by step number,
+    deduplicated by step (first occurrence wins — a station number is
+    sometimes referenced again later in the same table).
+    """
+    stations: dict[int, str] = {}
+    for m in _STATION_MARKER_RE.finditer(text):
+        step = int(m.group(1))
+        label = m.group(2).strip()
+        if label and step not in stations:
+            stations[step] = label
+    return [{"step": step, "label": stations[step]} for step in sorted(stations)]
+
+
+def _normalize_station_label(label: str) -> str:
+    """
+    Map a raw station label to a canonical office name from
+    _ALL_OFFICE_NAMES when one is embedded in it (e.g. "生僑組/原資中心" →
+    "生僑組", "教務處註冊組" → "教務處") — the raw label is often a compound
+    that the synthesized answer won't reproduce verbatim, but will almost
+    always mention the canonical office name it contains. Falls back to the
+    raw label unchanged when no canonical name matches (e.g. "系所簽章" has
+    no office-name entry — kept as-is since it's already a short, matchable
+    term on its own).
+    """
+    for name in _ALL_OFFICE_NAMES:
+        if name in label:
+            return name
+    return label
+
+
+def _extract_best_stations(context_pages: list[dict]) -> dict:
+    """
+    Take the FIRST moltke.nccu.edu.tw page (in context_pages order) with
+    >=2 station markers — one coherent procedure's stations should all come
+    from ONE page/form, not merged across pages (merging risks combining
+    unrelated numbered lists into one garbled sequence). "First", not "most
+    matches": context_pages is anchor-page(s)-first, expand-fetched
+    cross-references after (retrieval_anchor_node's own fetch is written
+    before retrieval_expand_node's Send-branch contributions land via the
+    operator.add reducer) — the anchor page is the one grep_texts matched
+    directly against the query's own topic, so it's the actually-relevant
+    form. 2026-08-26 confirmed picking by raw count instead is wrong: for
+    "如何辦理休學", QP-T01-03-02 (the correct, anchor-fetched 休學 form) has
+    a clean 7-station table, but QP-T01-03-05 (退學's form — a DIFFERENT
+    procedure, only pulled in because 休學's overview page cross-references
+    it) has 7 stations too PLUS 1 noise match (the moltke viewer renders
+    QP-T01-02-05's 委託書 content inline on other forms' pages, which this
+    regex also matches) for a spurious total of 8 — outscoring and replacing
+    the correct table under a "most matches" rule. "First" avoids this by
+    construction, without needing to specifically pattern-match away every
+    possible noise source.
+
+    Requires >=2 stations to count as a real table, not a single stray
+    "(3)" false-triggering; scoped to moltke.nccu.edu.tw pages (get_form()'s
+    own domain) since station tables structurally only exist on official
+    form documents, not general aca/osa pages (also confirmed 2026-08-26: a
+    非-form PDF with a numbered 公文 reference list otherwise false-triggers
+    this).
+    """
+    for page in context_pages:
+        if "moltke.nccu.edu.tw" not in page.get("url", ""):
+            continue
+        stations = _extract_stations(page.get("text", ""))
+        if len(stations) >= 2:
+            return {
+                "stations":     [{"step": s["step"], "label": _normalize_station_label(s["label"])} for s in stations],
+                "source_title": page.get("title", ""),
+            }
+    return {"stations": [], "source_title": ""}
 
 
 def extraction_node(state: AgentState) -> AgentState:
@@ -130,15 +224,19 @@ def extraction_node(state: AgentState) -> AgentState:
                 seen_notes.add(note)
                 notes.append({"text": note, "source_title": source_title})
 
+    station_info = _extract_best_stations(context_pages)
+
     checklist = {
-        "person_names": person_names,
-        "forms":        forms,
-        "notes":        notes,
+        "person_names":    person_names,
+        "forms":           forms,
+        "notes":           notes,
+        "stations":        station_info["stations"],
+        "stations_source": station_info["source_title"],
     }
     print(
         f"[extraction] {len(person_names)} person(s), "
         f"forms={[(f['id'], f['title']) for f in forms]}, "
-        f"notes={len(notes)}",
+        f"notes={len(notes)}, stations={[s['label'] for s in station_info['stations']]}",
         file=sys.stderr,
     )
     return {**state, "extraction_checklist": checklist}
@@ -151,6 +249,12 @@ def _format_checklist(checklist: dict) -> str:
 
     lines = ["【本次搜尋結果中實際找到的事實 checklist——以下項目若跟問題相關就必須出現在答案中，"
               "不要遺漏；checklist 沒列出的人名/表單/審核層級也不要自行補上】"]
+
+    if checklist.get("stations"):
+        lines.append(f"表單記載的辦理站點順序（來源：{checklist.get('stations_source', '') or '（無標題）'}）——"
+                     "答案的步驟清單必須涵蓋以下每一站，不要遺漏；也不要自行增加表單沒列出的站：")
+        for s in checklist["stations"]:
+            lines.append(f"  {s['step']}. {s['label']}")
 
     if checklist.get("person_names"):
         lines.append("承辦人：")

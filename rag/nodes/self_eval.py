@@ -143,6 +143,26 @@ def self_eval_node(state: AgentState) -> AgentState:
                 "請在每個步驟列出對應承辦人姓名（從【各辦公室聯絡資訊】引用）。"
             )
 
+    # Structural checklist (2026-08-26): checks the answer covers every
+    # numbered station the FORM'S OWN TABLE documents (extraction_node's
+    # _extract_best_stations) — this is the "right signal" the office_role_
+    # diversity attempt below went looking for but used the wrong data
+    # source for. Unlike person_names/notes (relevance-filtered, min(2,N)
+    # floor — some are legitimately irrelevant to this student), a
+    # documented station is not optional: if the form's table lists it, the
+    # procedure genuinely requires it, so ALL of them are required here, not
+    # a floor.
+    checklist_stations = state.get("extraction_checklist", {}).get("stations", [])
+    if checklist_stations:
+        hits = [s for s in checklist_stations if s["label"] in answer]
+        if len(hits) < len(checklist_stations):
+            missing = [s["label"] for s in checklist_stations if s not in hits]
+            failures.append(
+                f"答案未涵蓋表單記載的所有辦理站點（共 {len(checklist_stations)} 站，"
+                f"目前只有 {len(hits)} 站對應到答案；缺少：{'、'.join(missing)}）。"
+                "請依表單記載的站點順序逐一列出，不要遺漏任何一站。"
+            )
+
     # 2026-08-26: tried a dynamic check here — "does the answer show
     # multiple review layers for offices whose real contact roster has 2+
     # distinct job titles" — as a generalization of eval.py's static
