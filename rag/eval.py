@@ -52,7 +52,14 @@ EVAL_CRITERIA = [
     {
         "name":        "dean_approvals",
         "description": "教務處需經組長批示及教務長核准（QP-T01-03-02 表單明列兩層核准）",
-        "keywords":    ["組長", "教務長", "王揚忠", "劉吉軒"],
+        # 2026-08-27: dropped 王揚忠/劉吉軒 — with all 4 keywords + min_hits=2,
+        # "組長"+"王揚忠" (same person, the 組長 layer only) satisfied the
+        # threshold without "教務長" ever appearing, silently passing
+        # answers missing the second review layer entirely (the actual
+        # thing this criterion is supposed to verify). Only the two role
+        # words remain, so min_hits=2 now requires BOTH layers by
+        # construction, not an OR-style pick-any-2 across a 4-item list.
+        "keywords":    ["組長", "教務長"],
         "min_hits":    2,
     },
     {
