@@ -95,7 +95,25 @@ def grep_texts(
         except subprocess.TimeoutExpired:
             pass
 
-    return results[:max_results]
+    # Dedup by URL before truncating — confirmed 2026-08-27 that aca/osa's
+    # extracted_supplementary.jsonl content is entirely (100%, 37/37 and
+    # 46/46 URLs) duplicated in extracted_texts.jsonl for those two
+    # subdomains (the only two affected out of 153), so a matching keyword
+    # can hit the same page twice across the two files. Downstream callers
+    # already dedupe by URL, but only AFTER this function's max_results
+    # truncation — a duplicate hit here could consume a top-N slot a
+    # genuinely different result should have gotten. Keeps first occurrence,
+    # which is always the extracted_texts.jsonl copy (_extracted_paths()
+    # already orders that file before extracted_supplementary.jsonl).
+    seen_urls: set[str] = set()
+    deduped = []
+    for r in results:
+        if r["url"] in seen_urls:
+            continue
+        seen_urls.add(r["url"])
+        deduped.append(r)
+
+    return deduped[:max_results]
 
 
 # ── Tool 2: get_page ──────────────────────────────────────────────────────────

