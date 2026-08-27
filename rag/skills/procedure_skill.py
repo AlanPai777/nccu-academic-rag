@@ -17,9 +17,17 @@ from rag.agent_tools import (
 )
 from rag.domain_router import route_domain
 
-# Strip question-phrasing words to get the core topic noun for grep
+# Strip question-phrasing words to get the core topic noun for grep.
+# Longest/most-specific alternatives listed first so re.sub doesn't
+# partial-match a compound and strand a leftover character — confirmed
+# 2026-08-27 (Phase F Step 11, generalization test on "學士班畢業離校流程
+# 怎麼辦"): the bare "怎麼" alternative matched inside "...流程怎麼辦" before
+# reaching end-of-string, leaving a stray "辦" glued onto the topic
+# ("學士班畢業離校辦" — a keyword that matches nothing in the corpus).
+# "怎麼辦"/"如何辦" added as their own alternatives so the whole colloquial
+# ending is consumed together, not just its "怎麼"/"如何" prefix.
 _STRIP_RE = re.compile(
-    r'如何辦理|如何申請|怎麼辦理|怎麼申請|如何|怎麼|辦理程序|申請流程|辦理手續|申請步驟|步驟|流程|程序|辦理'
+    r'如何辦理|如何申請|怎麼辦理|怎麼申請|怎麼辦|如何辦|如何|怎麼|辦理程序|申請流程|辦理手續|申請步驟|步驟|流程|程序|辦理'
 )
 
 
