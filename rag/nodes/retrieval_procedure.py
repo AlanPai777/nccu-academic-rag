@@ -14,7 +14,7 @@ from __future__ import annotations
 from langgraph.types import Send
 
 from rag.agent_tools import grep_texts, get_page, extract_links, get_form, extract_form_ids
-from rag.domain_router import route_domain
+from rag.domain_router import route_domain, is_ambiguous
 from rag.skills.procedure_skill import _extract_keyword
 from rag.agent_runtime import _offices_from_context
 from rag.nodes.state import AgentState
@@ -40,9 +40,29 @@ def retrieval_anchor_node(state: AgentState) -> AgentState:
     # bias — falls back to "aca" only if Domain Router itself finds nothing
     # (Layer 1 + Layer 2 both empty), not as a silent default otherwise.
     subdomain = route_domain(query) or "aca"
-    main_results = grep_texts(keyword, subdomain=subdomain, max_results=5)
-    if not main_results:
+
+    # Layer 3 (CRAG-lite, condition 5): when Domain Router itself was
+    # unsure which subdomain to pick (is_ambiguous — the same signal
+    # Router-as-judge's gate uses), skip domain-scoping and search globally
+    # instead of trusting the possibly-wrong scoped subdomain. grep_texts()
+    # has no relevance ranking (plain `grep -i`, first-N-matches by glob
+    # order), so this isn't a "pick the better-scored result" comparison —
+    # it's a plain substitution, matching the plan's literal design
+    # ("重試改成subdomain=None，查全域FTS5索引"). Confirmed empirically
+    # (2026-08-27, before wiring this in) that global search still tends to
+    # surface the right page for the osa-dilution case ("復學" → aca's
+    # genuine page ranks #2 globally, ahead of osa's dorm-eligibility
+    # pages) — a side effect of "aca" sorting alphabetically early in
+    # grep_texts()'s glob, not a designed ranking mechanism, so this is a
+    # v1 that could regress differently on a case where the correct
+    # subdomain sorts LATER than a diluting one; not assumed to generalize
+    # beyond what's been tested.
+    if is_ambiguous(query):
         main_results = grep_texts(keyword, max_results=5)
+    else:
+        main_results = grep_texts(keyword, subdomain=subdomain, max_results=5)
+        if not main_results:
+            main_results = grep_texts(keyword, max_results=5)
 
     anchor_pages: list[dict] = []
     seen_urls: set[str] = set()

@@ -16,17 +16,24 @@ full four-layer design and its unresolved risks):
            hits by subdomain (count of matching pages) and returns the top
            subdomain.
 
-Deliberately NOT implemented yet: candidate hedging (Send-based dispatch
-when top-2 Layer 2 scores are close) and Layer 3 (CRAG-lite retry with
-subdomain=None on low-quality results). The planning report's Step 5 risk
-list explicitly says the CRAG-lite quality threshold and hedging trigger
-frequency are uncalibrated until Step 1's 6-question upper-bound data is
-run through this router — building those two now would mean tuning
-thresholds against zero real examples. route_domain() returns a single
-best-effort subdomain (or None); callers already have their own
-fallback-to-global behavior (grep_texts's own
-"if not main_results: grep_texts(keyword)" pattern), so a wrong or missing
-Domain Router guess degrades to Phase E's old behavior, not a hard failure.
+Layer 3 (CRAG-lite retry with subdomain=None on low-quality results,
+2026-08-27): implemented in retrieval_anchor_node (rag/nodes/
+retrieval_procedure.py), not here — it's is_ambiguous() below, gating a
+plain substitution ("search globally instead of domain-scoped") rather
+than a quality-scored comparison, since agent_tools.grep_texts() has no
+relevance ranking to compare scores on in the first place. Confirmed fixing
+the real osa-dilution case ("如何辦理復學") — see phase_f_planning_report.md
+for the full validation.
+
+Deliberately still NOT implemented: candidate hedging (Send-based dispatch
+when top-2 Layer 2 scores are close, comparing two candidates' retrieval
+quality) — Layer 3's global-search substitution already covers much of what
+hedging was meant to address (search everything instead of picking between
+two guesses), so hedging is deferred pending evidence that Layer 3's
+simpler v1 isn't sufficient, not built defensively alongside it.
+route_domain() itself is unchanged — still returns a single best-effort
+subdomain (or None); is_ambiguous() is a separate, additional signal
+callers can check.
 
 Layer 2 aggregation method: count (number of matching pages per
 subdomain), not max or sum — chosen empirically (2026-08-26) after
