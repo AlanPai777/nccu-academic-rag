@@ -186,5 +186,3 @@ def run_anchor_expand_sequential(sub_state: AgentState) -> AgentState:
         "context_pages": context_pages,
         "sources":       sources,
     }
-
-    return {"context_pages": [], "sources": []}
