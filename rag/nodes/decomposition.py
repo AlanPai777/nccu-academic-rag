@@ -15,6 +15,7 @@ from langgraph.types import Send
 from rag.router import route, QueryType, _keyword_route
 from rag.nodes.state import AgentState
 from rag.nodes.retrieval_knowledge import retrieval_node
+from rag.nodes.retrieval_procedure import run_anchor_expand_sequential
 from rag.nodes.office_lookup import office_lookup_node
 from rag.nodes.extraction import extraction_node
 
@@ -63,13 +64,22 @@ def sub_query_node(state: AgentState) -> AgentState:
     ...} merge — same rule retrieval_expand_node already follows, since N
     branches write concurrently within one LangGraph superstep.
 
-    Body is unchanged from merge_node's old per-sub_query loop iteration:
-    route() → retrieval_node/office_lookup_node/extraction_node as plain
-    function calls against an isolated sub_state (not through graph
-    routing) — same node functions the single-query path uses, not
-    reimplemented. retrieval_node is skipped for CONTACT sub-queries,
-    matching _after_router's routing behaviour (retrieval_node's KNOWLEDGE
-    branch would otherwise run for CONTACT, which it was never designed for).
+    route() → retrieval/office_lookup_node/extraction_node as plain function
+    calls against an isolated sub_state (not through graph routing) — same
+    node functions the single-query path uses, not reimplemented.
+    retrieval is skipped for CONTACT sub-queries, matching _after_router's
+    routing behaviour (retrieval_node's KNOWLEDGE branch would otherwise run
+    for CONTACT, which it was never designed for).
+
+    PROCEDURE sub-queries use run_anchor_expand_sequential() (Step 4.5's
+    anchor+expand, sequential-in-branch — see its own docstring for why not
+    Send-parallelized here) instead of retrieval_node's ProcedureSkill
+    fallback — closes the "known follow-up" gap retrieval_node's docstring
+    used to flag: composite queries' PROCEDURE sub-queries now get the same
+    adaptive anchor+expand retrieval (dynamic link/form-count expansion) the
+    single-query PROCEDURE path already had since Step 4.5, not the fixed
+    3-step ProcedureSkill version. retrieval_node itself is unchanged and
+    still used for KNOWLEDGE sub-queries.
     """
     sub_query = state["_sub_query"]
     result = route(sub_query)
@@ -84,7 +94,9 @@ def sub_query_node(state: AgentState) -> AgentState:
         "sources":              [],
     }
 
-    if result.query_type in (QueryType.PROCEDURE, QueryType.KNOWLEDGE):
+    if result.query_type == QueryType.PROCEDURE:
+        sub_state = run_anchor_expand_sequential(sub_state)
+    elif result.query_type == QueryType.KNOWLEDGE:
         sub_state = retrieval_node(sub_state)
 
     sub_state = office_lookup_node(sub_state)

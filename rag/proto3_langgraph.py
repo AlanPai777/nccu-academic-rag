@@ -14,7 +14,7 @@ Graph:
                                   │                                 ╰──(CONTACT)───────────────────────────────────────────────────────────────────────────────────▶ office_lookup_node
                                   │                                                                                                                                          │
                                   │                                                                                                                                  extraction_node
-                                  ╰──(composite)──▶ sub_query_node [Send ×N, one per sub_query] ──▶ merge_node (flatten+dedupe; each branch still uses retrieval_node/ProcedureSkill internally, not anchor+expand — known follow-up) ─╯
+                                  ╰──(composite)──▶ sub_query_node [Send ×N, one per sub_query] ──▶ merge_node (flatten+dedupe; PROCEDURE sub-queries use anchor+expand sequentially-in-branch) ─╯
                                                                                                                                                                               │
                                                                                                                                                                       synthesis_node ◀─╮
                                                                                                                                                                               │         │ correction_hint set

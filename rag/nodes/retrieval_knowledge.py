@@ -1,10 +1,10 @@
 """
 rag/nodes/retrieval_knowledge.py
 retrieval_node: the KNOWLEDGE-path LLM-driven agent loop (grep + get_page,
-via _TOOLS/ChatOllama-style tool calling), plus the PROCEDURE branch kept
-only for merge_node's composite-sub-query path (see retrieval_node's own
-docstring for why the main single-query PROCEDURE path no longer reaches
-this branch).
+via _TOOLS/ChatOllama-style tool calling). Used both as a graph node (Step
+5's single-query KNOWLEDGE path, via _after_router) and as a plain function
+call (decomposition.py's sub_query_node, for composite KNOWLEDGE
+sub-queries).
 """
 
 from __future__ import annotations
@@ -12,11 +12,9 @@ from __future__ import annotations
 import json
 import sys
 
-from rag.router import QueryType
 from rag.llm_client import chat_with_tools
 from rag.agent_tools import grep_texts, get_page, extract_links, get_children, get_form
 from rag.domain_router import route_domain
-from rag.skills.procedure_skill import ProcedureSkill
 from rag.nodes.state import AgentState
 
 # ── Tool schema ───────────────────────────────────────────────────────────────
@@ -125,35 +123,16 @@ def _dispatch(name: str, args: dict):
 
 def retrieval_node(state: AgentState) -> AgentState:
     """
-    Fetch relevant pages.
-
-    KNOWLEDGE → LLM-driven agent loop (grep + get_page) — the main-path use.
-    PROCEDURE → ProcedureSkill (deterministic 3-step: grep → links → form) —
-                kept ONLY for merge_node's composite-sub-query loop (Step 2.5),
-                which calls this function directly and isn't wired through
-                Send. The main single-query PROCEDURE path no longer reaches
-                this branch: router_node routes PROCEDURE to
-                retrieval_anchor_node instead (Step 4.5, condition 2) — same
-                grep→links→form idea, but anchor is sequential/deterministic
-                and links+forms expand in parallel via Send instead of
-                ProcedureSkill's fixed sequential loop. Known follow-up, not
-                yet done: give merge_node's composite path the same
-                anchor+expand adaptivity — it still uses this fixed 3-step
-                version for now.
-    CONTACT   → not reached (conditional edge routes directly to office_lookup_node)
+    Fetch relevant pages — KNOWLEDGE-only LLM-driven agent loop (grep +
+    get_page). PROCEDURE and CONTACT never reach this function: single-query
+    PROCEDURE uses retrieval_anchor_node/retrieval_expand_node (Step 4.5
+    anchor+expand), composite PROCEDURE sub-queries use
+    run_anchor_expand_sequential() (decomposition.py's sub_query_node, same
+    anchor+expand logic called sequentially-in-branch), and CONTACT is
+    routed straight to office_lookup_node by the conditional edge.
     """
     query = state["query"]
 
-    if state["query_type"] == QueryType.PROCEDURE:
-        skill  = ProcedureSkill()
-        result = skill.run(query)
-        return {
-            **state,
-            "context_pages": result.get("context", []),
-            "sources":       result.get("source_urls", []),
-        }
-
-    # KNOWLEDGE: LLM-driven agent loop
     # E5 Doom Loop Detector constants
     _MAX_TURNS      = 10   # hard cap on LLM turns
     _MAX_STUCK      = 3    # exit if all tool calls are duplicates for this many consecutive turns

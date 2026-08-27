@@ -126,3 +126,45 @@ def retrieval_expand_node(state: AgentState) -> AgentState:
         return {"context_pages": [page], "sources": [page["url"]]}
 
     return {"context_pages": [], "sources": []}
+
+
+def run_anchor_expand_sequential(sub_state: AgentState) -> AgentState:
+    """
+    Sequential-in-branch version of anchor+expand, for sub_query_node's
+    PROCEDURE branch (decomposition.py) — the composite-query path's known
+    follow-up (see retrieval_node's old docstring note). sub_query_node is
+    ALREADY a Send-branch itself (dispatched by _dispatch_sub_queries), so
+    giving it a SECOND, nested layer of Send-based parallelism for expand
+    would need Send targets reachable from within an already-Send-dispatched
+    node — a bigger structural change than this pass is scoped for. Mirrors
+    Step 2.5's own precedent (query_decomposition shipped sequential first,
+    Send-parallelized later as an explicit follow-up, not silently left
+    sequential forever) — same treatment here, not a permanent design
+    decision.
+
+    Reuses _dispatch_expand()'s own target-building logic (same list of
+    Send objects the real single-query graph path would fan out on) instead
+    of reimplementing which links/form IDs become targets — just calls each
+    target's node function directly instead of routing it through the
+    graph, accumulating results with a plain list instead of LangGraph's
+    operator.add reducer.
+    """
+    anchor_result = retrieval_anchor_node(sub_state)
+    targets = _dispatch_expand(anchor_result)
+
+    context_pages = list(anchor_result.get("context_pages", []))
+    sources = list(anchor_result.get("sources", []))
+    for send in targets:
+        if send.node != "retrieval_expand_node":
+            continue  # the "no targets" fallback Send (→ office_lookup_node) — nothing to run here
+        delta = retrieval_expand_node(send.arg)
+        context_pages.extend(delta.get("context_pages", []))
+        sources.extend(delta.get("sources", []))
+
+    return {
+        **anchor_result,
+        "context_pages": context_pages,
+        "sources":       sources,
+    }
+
+    return {"context_pages": [], "sources": []}
