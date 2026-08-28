@@ -163,7 +163,7 @@ def _render_messages(messages: list) -> str:
             for tc in m.tool_calls:
                 lines.append(f"[agent決定呼叫] {tc['name']}({tc['args']})")
         elif isinstance(m, ToolMessage):
-            lines.append(f"[工具結果] {str(m.content)[:250]}")
+            lines.append(f"[工具結果] {str(m.content)}")
     return "\n".join(lines) if lines else "（尚無記錄）"
 
 
@@ -205,7 +205,7 @@ def get_page_tool(url: str) -> str:
     if "error" in p:
         return f"get_page 失敗: {p['error']}"
     text = p.get("text", "")
-    return f"get_page 取得 {len(text)} 字，標題: {p.get('title','')}\n\n全文：\n{text[:3000]}"
+    return f"get_page 取得 {len(text)} 字，標題: {p.get('title','')}\n\n全文：\n{text}"
 
 
 @tool
@@ -223,7 +223,7 @@ def get_form_tool(form_id: str) -> str:
     f = _get_form_raw(form_id)
     if "error" in f:
         return f"get_form 失敗: {f['error']}"
-    return f"get_form 取得表單 {f.get('form_title','')}\n\n{f.get('text','')[:3000]}"
+    return f"get_form 取得表單 {f.get('form_title','')}\n\n{f.get('text','')}"
 
 
 TOOLS = [search_texts, grep_texts_tool, get_page_tool, extract_links_tool, get_form_tool]
