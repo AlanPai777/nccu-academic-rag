@@ -189,23 +189,26 @@ def search_texts(state: Annotated[dict, InjectedState]) -> str:
 
 
 @tool
-def grep_texts_tool(pattern: str, subdomain: str = "") -> str:
-    """純字面比對搜尋，沒有相關性排序，自己指定關鍵字。當search_texts找不到好結果、或你想用一個更精確/不同角度的詞直接試時使用。"""
-    r = _grep_texts_raw(pattern, subdomain=subdomain or None, max_results=5)
+def grep_texts_tool(pattern: str, state: Annotated[dict, InjectedState], subdomain: str = "") -> str:
+    """純字面比對搜尋，沒有相關性排序，自己指定關鍵字。當search_texts找不到好結果、或你想用一個更精確/不同角度的詞直接試時使用。預設只搜這題的subdomain範圍（找不到會自動退回全域搜尋）；若你判斷答案在別的subdomain，可自己指定subdomain參數覆蓋。"""
+    scope = subdomain or state.get("subdomain_hint")
+    r = _grep_texts_raw(pattern, subdomain=scope, max_results=5)
+    if not r and scope:
+        r = _grep_texts_raw(pattern, subdomain=None, max_results=5)
     if not r:
         return f"grep_texts('{pattern}') 0筆結果"
-    top3 = "\n".join(f"{i+1}. {x['title'][:40]} | URL: {x['url']}" for i, x in enumerate(r[:3]))
+    top3 = "\n".join(f"{i+1}. [{x['subdomain']}] {x['title'][:40]} | URL: {x['url']}" for i, x in enumerate(r[:3]))
     return f"grep_texts('{pattern}') 找到{len(r)}筆，前3筆:\n{top3}"
 
 
 @tool
-def get_page_tool(url: str) -> str:
+def get_page_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
     """取得已知URL的完整頁面內容。只在已有明確URL時呼叫。"""
-    p = _get_page_raw(url)
+    p = _get_page_raw(url, subdomain=state.get("subdomain_hint"))
     if "error" in p:
         return f"get_page 失敗: {p['error']}"
     text = p.get("text", "")
-    return f"get_page 取得 {len(text)} 字，標題: {p.get('title','')}\n\n全文：\n{text}"
+    return f"get_page 取得 {len(text)} 字，標題: {p.get('title','')}，subdomain: {p.get('subdomain','')}\n\n全文：\n{text}"
 
 
 @tool
