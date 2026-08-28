@@ -196,13 +196,15 @@ def _search_pages_for_url(search_glob: str, url: str, decoded: str) -> dict | No
 
 # ── Tool 3: extract_links ─────────────────────────────────────────────────────
 
-def extract_links(url: str) -> list[dict]:
+def extract_links(url: str, subdomain: str | None = None) -> list[dict]:
     """
     Extract all markdown links to *.nccu.edu.tw from a page's text.
     Critical for following aca→osa cross-domain references (e.g. refund page).
+    subdomain: optional hint, same scoped-first/global-fallback behavior as
+               get_page() (which this delegates to).
     Returns [{label, url}, ...]
     """
-    page = get_page(url)
+    page = get_page(url, subdomain=subdomain)
     if "error" in page:
         return []
 

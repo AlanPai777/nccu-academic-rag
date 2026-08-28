@@ -167,6 +167,21 @@ def _render_messages(messages: list) -> str:
     return "\n".join(lines) if lines else "（尚無記錄）"
 
 
+def _fetched_urls(messages: list) -> set[str]:
+    """URLs the agent has already called get_page_tool on this run -- used by
+    grep_texts_tool to avoid re-surfacing pages the agent has already fully
+    read as if they were new candidates."""
+    urls = set()
+    for m in messages:
+        if isinstance(m, AIMessage) and m.tool_calls:
+            for tc in m.tool_calls:
+                if tc["name"] == "get_page_tool":
+                    u = tc["args"].get("url")
+                    if u:
+                        urls.add(u)
+    return urls
+
+
 # ── Tools — real LangChain @tool functions, dispatched by real ToolNode ────
 
 @tool
@@ -190,15 +205,19 @@ def search_texts(state: Annotated[dict, InjectedState]) -> str:
 
 @tool
 def grep_texts_tool(pattern: str, state: Annotated[dict, InjectedState], subdomain: str = "") -> str:
-    """純字面比對搜尋，沒有相關性排序，自己指定關鍵字。當search_texts找不到好結果、或你想用一個更精確/不同角度的詞直接試時使用。預設只搜這題的subdomain範圍（找不到會自動退回全域搜尋）；若你判斷答案在別的subdomain，可自己指定subdomain參數覆蓋。"""
+    """純字面比對搜尋，沒有相關性排序，自己指定關鍵字。當search_texts找不到好結果、或你想用一個更精確/不同角度的詞直接試時使用。預設只搜這題的subdomain範圍（找不到會自動退回全域搜尋）；若你判斷答案在別的subdomain，可自己指定subdomain參數覆蓋。已經get_page過的頁面不會重複出現在候選裡。"""
     scope = subdomain or state.get("subdomain_hint")
-    r = _grep_texts_raw(pattern, subdomain=scope, max_results=5)
+    r = _grep_texts_raw(pattern, subdomain=scope, max_results=20)
     if not r and scope:
-        r = _grep_texts_raw(pattern, subdomain=None, max_results=5)
+        r = _grep_texts_raw(pattern, subdomain=None, max_results=20)
     if not r:
         return f"grep_texts('{pattern}') 0筆結果"
-    top3 = "\n".join(f"{i+1}. [{x['subdomain']}] {x['title'][:40]} | URL: {x['url']}" for i, x in enumerate(r[:3]))
-    return f"grep_texts('{pattern}') 找到{len(r)}筆，前3筆:\n{top3}"
+    fetched = _fetched_urls(state.get("messages", []))
+    unseen = [x for x in r if x["url"] not in fetched]
+    shown = unseen if unseen else r
+    note = "（已濾掉你讀過的頁面）" if unseen and len(unseen) < len(r) else ""
+    top3 = "\n".join(f"{i+1}. [{x['subdomain']}] {x['title'][:40]} | URL: {x['url']}" for i, x in enumerate(shown[:3]))
+    return f"grep_texts('{pattern}') 找到{len(r)}筆{note}，前3筆:\n{top3}"
 
 
 @tool
@@ -212,9 +231,9 @@ def get_page_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
 
 
 @tool
-def extract_links_tool(url: str) -> str:
+def extract_links_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
     """取得頁面正文明確提到的其他連結。"""
-    links = _extract_links_raw(url)
+    links = _extract_links_raw(url, subdomain=state.get("subdomain_hint"))
     if not links:
         return "extract_links 找到 0 個連結"
     return "extract_links 找到:\n" + "\n".join(f"- {l['label']}: {l['url']}" for l in links[:10])
