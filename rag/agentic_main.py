@@ -55,8 +55,7 @@ from rag.agent_tools import (
 )
 
 FTS_DB = "rag/fts_proto3.db"
-_MAX_TURNS = 8
-_MAX_STUCK = 3
+_MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see _after_agent
 
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://ollama.com")
@@ -125,7 +124,17 @@ _AGENT_SYSTEM = """你是政大學務問答系統的搜尋agent，任務是找�
 
 **重要規則**：search_texts或grep_texts回傳的候選只有標題跟預覽，不是完整內容。如果剛找到一個看起來有希望的候選（標題主題相符），下一步幾乎都該是對那個候選的URL呼叫get_page取得全文，不要對同一個主題再搜一次或改搜候選的標題文字——只有get_page才能真正確認候選內容對不對。只有在get_page讀完全文、確認這個候選不是答案（且內文沒有指向其他文件的線索）時，才考慮換關鍵字重新搜尋。
 
-如果你已經有足夠資訊能回答原始問題了，不要呼叫任何工具，但你的文字回覆本身就必須「是」完整答案——直接寫出具體的申請流程/條件/期限等實際內容並附來源URL，不要寫「我會列出...」「我將說明...」這種描述你打算做什麼的句子，那不是答案，是你還沒寫答案。"""
+如果你已經有足夠資訊能回答原始問題了，不要呼叫任何工具，但你的文字回覆本身就必須「是」完整答案——直接寫出具體的申請流程/條件/期限等實際內容並附來源URL，不要寫「我會列出...」「我將說明...」這種描述你打算做什麼的句子，那不是答案，是你還沒寫答案。
+
+**範例1：get_page讀完全文後，內容確實回答了問題，該直接作答**
+情境：問題是「如何辦理休學」，你已經呼叫get_page讀到「休學規定」頁面全文，內容包含申請方式、時間、費用等。
+正確做法：不呼叫任何工具，直接輸出：「辦理休學的流程如下：1. 填寫休學申請書...2. ...（實際列出全文裡的具體條文內容）...來源：[URL]」
+錯誤做法：輸出「我已經取得完整內容，將列出休學的申請條件、辦理流程...」——這只是描述你打算做什麼，沒有把內容本身寫出來，等於還沒回答。
+
+**範例2：問題裡有身分/情境修飾詞，搜尋2-3次仍找不到該修飾詞的專屬規定時，該用一般規則作答並誠實註明**
+情境：問題是「在職生怎麼辦理復學」，你已經get_page讀到一般性的「復學」規定頁面（沒有特別提到「在職生」），也嘗試搜尋「在職生 復學」「在職生」等詞2-3次都找不到專屬於在職生的特殊規定。
+正確做法：不要再繼續搜尋，直接用已有的一般復學規定作答，並加一句「未查到在職生專屬的特殊規定，以下為一般復學流程」。
+錯誤做法：持續換不同關鍵字搜尋超過2-3次仍找不到，既不作答也不停止——這是在浪費輪次，一般規則沒有明確排除某身分時，適用一般規則是合理的假設，比無限期搜尋更有用。"""
 
 
 def _rewrite_query(text: str) -> str:
@@ -250,24 +259,32 @@ def agent_node(state: Step13State) -> dict:
 
 
 def _after_agent(state: Step13State) -> str:
+    # 2026-08-28: _MAX_TURNS hard cap deliberately removed for this experiment
+    # -- let the agent decide for itself when it has enough, per the session's
+    # core research question (don't cap turns deterministically to avoid
+    # trusting the LLM's own stopping judgment). doom-loop detection (below,
+    # in _after_tools) is the ONLY remaining safety net, and it only catches
+    # exact-repeat tool_calls -- it will NOT catch an agent that keeps trying
+    # genuinely different search terms without ever concluding (the "在職生
+    # 復學" failure mode from v1 testing was exactly this shape, and would
+    # NOT have been caught by doom-loop alone). If this experiment shows real
+    # runaway cost, a generous risk-only ceiling (not a correctness cap) is
+    # the fallback -- not reintroducing _MAX_TURNS=8 as-is.
     last = state["messages"][-1]
     if not getattr(last, "tool_calls", None):
-        return "end"
-    if state["turn"] >= _MAX_TURNS:
         return "end"
     return "tools"
 
 
 def _after_tools(state: Step13State) -> str:
-    # doom-loop: count consecutive AIMessages with identical tool_calls signature
+    # doom-loop: count consecutive AIMessages with identical tool_calls signature.
+    # This is now the ONLY loop-termination safety net -- see _after_agent.
     ai_msgs = [m for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls]
     if len(ai_msgs) >= _MAX_STUCK:
         sigs = [tuple(sorted((tc["name"], json.dumps(tc["args"], sort_keys=True)) for tc in m.tool_calls))
                 for m in ai_msgs[-_MAX_STUCK:]]
         if len(set(sigs)) == 1:
             return "end"
-    if state["turn"] >= _MAX_TURNS:
-        return "end"
     return "rewrite"
 
 
