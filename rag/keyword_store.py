@@ -217,16 +217,25 @@ class KeywordStore:
         finally:
             conn.close()
 
-    def search(self, query: str, top_k: int = 20) -> list[dict]:
+    def search(self, query: str, top_k: int = 20, subdomain: str | None = None) -> list[dict]:
         """BM25 keyword search.
 
         Args:
             query: Search query (Chinese or English)
             top_k: Maximum results to return
+            subdomain: restrict results to one subdomain (e.g. "aca");
+                       None (default) searches all indexed subdomains.
+                       Added Phase F Step 13 — grep_texts()'s FTS5 upgrade
+                       needs subdomain-scoped search (mirroring
+                       domain_router's Layer 3 pattern), which the previous
+                       version of this method couldn't do (it didn't expose
+                       subdomain at all, which is why domain_router.py's
+                       layer2_candidates() bypassed this method and wrote
+                       its own SQL — see that module's docstring).
 
         Returns:
             List of dicts matching retriever format:
-            {text, text_clean, url, title, category, source_type,
+            {text, text_clean, url, title, subdomain, category, source_type,
              chunk_index, chunk_type, bm25_score}
         """
         if not self.exists():
@@ -240,17 +249,23 @@ class KeywordStore:
 
             # FTS5 MATCH with BM25 ranking
             # bm25() returns negative scores (more negative = better match)
-            rows = conn.execute("""
+            sql = """
                 SELECT
                     m.url, m.title, m.source_type, m.category,
                     m.text, m.text_clean, m.chunk_index, m.chunk_type,
-                    bm25(chunks_fts) as score
+                    m.subdomain, bm25(chunks_fts) as score
                 FROM chunks_fts f
                 JOIN chunks_meta m ON f.rowid = m.rowid
                 WHERE chunks_fts MATCH ?
-                ORDER BY score ASC
-                LIMIT ?
-            """, (fts_query, top_k)).fetchall()
+            """
+            params: list = [fts_query]
+            if subdomain:
+                sql += " AND m.subdomain = ?"
+                params.append(subdomain)
+            sql += " ORDER BY score ASC LIMIT ?"
+            params.append(top_k)
+
+            rows = conn.execute(sql, params).fetchall()
 
             results = []
             for row in rows:
@@ -263,7 +278,8 @@ class KeywordStore:
                     "text_clean":  row[5],
                     "chunk_index": row[6],
                     "chunk_type":  row[7],
-                    "bm25_score":  round(-row[8], 4),  # flip sign: higher = better
+                    "subdomain":   row[8],
+                    "bm25_score":  round(-row[9], 4),  # flip sign: higher = better
                 })
             return results
 
