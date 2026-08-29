@@ -52,6 +52,7 @@ from rag.agent_tools import (
     get_page as _get_page_raw,
     extract_links as _extract_links_raw,
     get_form as _get_form_raw,
+    extract_form_ids,
 )
 from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous
 
@@ -237,7 +238,11 @@ def get_page_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
     if "error" in p:
         return f"get_page 失敗: {p['error']}"
     text = p.get("text", "")
-    return f"get_page 取得 {len(text)} 字，標題: {p.get('title','')}，subdomain: {p.get('subdomain','')}\n\n全文：\n{text}"
+    header = f"get_page 取得 {len(text)} 字，標題: {p.get('title','')}，subdomain: {p.get('subdomain','')}"
+    form_ids = sorted(extract_form_ids(text))
+    if form_ids:
+        header += f"\n[偵測到表單編號: {', '.join(form_ids)}]"
+    return f"{header}\n\n全文：\n{text}"
 
 
 @tool
