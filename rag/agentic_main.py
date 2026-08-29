@@ -53,9 +53,19 @@ from rag.agent_tools import (
     extract_links as _extract_links_raw,
     get_form as _get_form_raw,
 )
+from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous
 
 FTS_DB = "rag/fts_proto3.db"
 _MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see _after_agent
+
+# Known office mandates -- deliberately incomplete (only core offices seen in
+# testing so far). Other subdomains show "尚無職掌描述" in domain_router_node's
+# candidate message; see docs/phase_g_clean_pipeline_design.md §B.4.
+_SUBDOMAIN_DESC = {
+    "aca": "教務處：負責註冊/學籍/畢業/休復學等",
+    "osa": "學務處：負責宿舍/獎學金/社團等",
+    "cashier": "出納組：負責繳費/退費",
+}
 
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://ollama.com")
@@ -269,6 +279,39 @@ def rewrite_node(state: AgenticState) -> dict:
     return {"turn": turn, "rewritten": rewritten, "messages": [HumanMessage(content=prompt)]}
 
 
+def domain_router_node(state: AgenticState) -> dict:
+    """Runs once, right after turn 1's rewrite_node (consumes its cleaned
+    `rewritten` output, not the raw query -- see phase_g_clean_pipeline_design.md
+    §A). No-ops whenever subdomain_hint is already truthy, which both
+    preserves an explicit --subdomain CLI override and makes this node
+    effectively execute only once despite sitting in the every-turn loop."""
+    if state.get("subdomain_hint"):
+        return {}
+
+    q = state["rewritten"]
+    hit = _layer1_match(q)
+    if hit:
+        msg = (f"候選subdomain（依「{q}」查詢得出）：\n"
+               f"1. {hit}（{_SUBDOMAIN_DESC.get(hit, '尚無職掌描述')}）— 關鍵字精確比對命中，非FTS5票數")
+        return {"subdomain_hint": hit, "messages": [HumanMessage(content=msg)]}
+
+    candidates = layer2_candidates(q)
+    if not candidates:
+        msg = f"候選subdomain（依「{q}」查詢得出）：無（Layer1/Layer2皆未找到相關subdomain，將使用全域搜尋）"
+        return {"subdomain_hint": None, "messages": [HumanMessage(content=msg)]}
+
+    lines = [f"候選subdomain（依票數排序，依「{q}」查詢得出）："]
+    for i, (sub, count) in enumerate(candidates[:5], start=1):
+        lines.append(f"{i}. {sub}（{_SUBDOMAIN_DESC.get(sub, '尚無職掌描述')}）— {count}筆命中")
+    if is_ambiguous(q):
+        top, second = candidates[0][1], candidates[1][1]
+        lines.append(f"判斷：候選接近（{second}/{top}≈{second/top:.2f}），建議優先查{candidates[0][0]}，"
+                     f"若結果不理想可考慮{candidates[1][0]}")
+    else:
+        lines.append(f"判斷：{candidates[0][0]}明確領先，非模糊案例")
+    return {"subdomain_hint": candidates[0][0], "messages": [HumanMessage(content="\n".join(lines))]}
+
+
 def agent_node(state: AgenticState) -> dict:
     messages = state["messages"]
     if not any(isinstance(m, SystemMessage) for m in messages):
@@ -315,11 +358,13 @@ def _after_tools(state: AgenticState) -> str:
 def build_graph():
     g = StateGraph(AgenticState)
     g.add_node("rewrite_node", rewrite_node)
+    g.add_node("domain_router_node", domain_router_node)
     g.add_node("agent_node", agent_node)
     g.add_node("tools", ToolNode(TOOLS))
 
     g.add_edge(START, "rewrite_node")
-    g.add_edge("rewrite_node", "agent_node")
+    g.add_edge("rewrite_node", "domain_router_node")
+    g.add_edge("domain_router_node", "agent_node")
     g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": END})
     g.add_conditional_edges("tools", _after_tools, {"rewrite": "rewrite_node", "end": END})
 
@@ -337,6 +382,7 @@ def run(query: str, subdomain_hint: str | None = None, stream: bool = False) -> 
         final_state = dict(initial)
         for update in graph.stream(initial, stream_mode="updates"):
             for node_name, delta in update.items():
+                delta = delta or {}  # a node returning {} (e.g. domain_router_node's no-op turns) surfaces as None here
                 print(f"[{node_name}] {list(delta.keys())}", file=sys.stderr)
                 for k, v in delta.items():
                     if k == "messages":
