@@ -64,7 +64,7 @@ OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 
 # ── State ─────────────────────────────────────────────────────────────────
 
-class Step13State(TypedDict):
+class AgenticState(TypedDict):
     query: str
     subdomain_hint: str | None
     turn: int
@@ -259,7 +259,7 @@ _llm_with_tools = _llm.bind_tools(TOOLS)
 
 # ── Nodes ────────────────────────────────────────────────────────────────
 
-def rewrite_node(state: Step13State) -> dict:
+def rewrite_node(state: AgenticState) -> dict:
     turn = state.get("turn", 0) + 1
     messages = state.get("messages", [])
     basis = state["query"] if not messages else f"{state['query']}\n\n已知進度：\n{_render_messages(messages)}"
@@ -269,7 +269,7 @@ def rewrite_node(state: Step13State) -> dict:
     return {"turn": turn, "rewritten": rewritten, "messages": [HumanMessage(content=prompt)]}
 
 
-def agent_node(state: Step13State) -> dict:
+def agent_node(state: AgenticState) -> dict:
     messages = state["messages"]
     if not any(isinstance(m, SystemMessage) for m in messages):
         messages = [SystemMessage(content=_AGENT_SYSTEM)] + messages
@@ -280,7 +280,7 @@ def agent_node(state: Step13State) -> dict:
     return result
 
 
-def _after_agent(state: Step13State) -> str:
+def _after_agent(state: AgenticState) -> str:
     # 2026-08-28: _MAX_TURNS hard cap deliberately removed for this experiment
     # -- let the agent decide for itself when it has enough, per the session's
     # core research question (don't cap turns deterministically to avoid
@@ -298,7 +298,7 @@ def _after_agent(state: Step13State) -> str:
     return "tools"
 
 
-def _after_tools(state: Step13State) -> str:
+def _after_tools(state: AgenticState) -> str:
     # doom-loop: count consecutive AIMessages with identical tool_calls signature.
     # This is now the ONLY loop-termination safety net -- see _after_agent.
     ai_msgs = [m for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls]
@@ -313,7 +313,7 @@ def _after_tools(state: Step13State) -> str:
 # ── Graph assembly ───────────────────────────────────────────────────────
 
 def build_graph():
-    g = StateGraph(Step13State)
+    g = StateGraph(AgenticState)
     g.add_node("rewrite_node", rewrite_node)
     g.add_node("agent_node", agent_node)
     g.add_node("tools", ToolNode(TOOLS))
@@ -328,7 +328,7 @@ def build_graph():
 
 def run(query: str, subdomain_hint: str | None = None, stream: bool = False) -> dict:
     graph = build_graph()
-    initial: Step13State = {
+    initial: AgenticState = {
         "query": query, "subdomain_hint": subdomain_hint, "turn": 0, "rewritten": "",
         "stuck_turns": 0, "messages": [], "answer": None,
     }
