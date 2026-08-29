@@ -249,7 +249,7 @@ def get_page_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
 
 @tool
 def extract_links_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
-    """取得頁面正文明確提到的其他連結。"""
+    """取得頁面正文明確提到的其他連結。當目前頁面內容不足以回答問題、但內文提到其他相關文件或頁面時使用。"""
     links = _extract_links_raw(url, subdomain=state.get("subdomain_hint"))
     if not links:
         return "extract_links 找到 0 個連結"
@@ -258,7 +258,7 @@ def extract_links_tool(url: str, state: Annotated[dict, InjectedState]) -> str:
 
 @tool
 def get_form_tool(form_id: str) -> str:
-    """取得已知表單編號的完整內容。"""
+    """取得已知表單編號的完整內容。當頁面提到表單編號、但你不確定頁面本身的敘述是否已涵蓋完整細節時使用——表單常包含頁面沒寫清楚的細節。"""
     f = _get_form_raw(form_id)
     if "error" in f:
         return f"get_form 失敗: {f['error']}"
