@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import operator
 import os
+import re
 import sys
 from typing import Annotated, TypedDict
 
@@ -348,7 +349,31 @@ def _after_agent(state: AgenticState) -> str:
     return "tools"
 
 
+_FORM_MARKER_RE = re.compile(r"\[偵測到表單編號: ([^\]]+)\]")
+
+
+def resource_node(state: AgenticState) -> dict:
+    """Deterministically triggered by _after_tools when the last ToolMessage
+    carries a "[偵測到表單編號: ...]" marker (set by get_page_tool) -- not an
+    agent-selected tool_call, so no agent has veto power here (per
+    docs/phase_g_clean_pipeline_design.md §M D3/D6). Fetches each detected
+    form's full content via the existing get_form_tool logic (no
+    duplication) and hands it back as a HumanMessage -- same pattern as
+    domain_router_node, since this isn't a response to any AIMessage
+    tool_call and so can't legitimately be a ToolMessage."""
+    last = state["messages"][-1]
+    m = _FORM_MARKER_RE.search(str(last.content))
+    if not m:
+        return {}
+    form_ids = [f.strip() for f in m.group(1).split(",")]
+    results = [get_form_tool.invoke({"form_id": fid}) for fid in form_ids]
+    return {"messages": [HumanMessage(content="\n\n".join(results))]}
+
+
 def _after_tools(state: AgenticState) -> str:
+    last = state["messages"][-1]
+    if isinstance(last, ToolMessage) and _FORM_MARKER_RE.search(str(last.content)):
+        return "resource"
     # doom-loop: count consecutive AIMessages with identical tool_calls signature.
     # This is now the ONLY loop-termination safety net -- see _after_agent.
     ai_msgs = [m for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls]
@@ -368,12 +393,14 @@ def build_graph():
     g.add_node("domain_router_node", domain_router_node)
     g.add_node("agent_node", agent_node)
     g.add_node("tools", ToolNode(TOOLS))
+    g.add_node("resource_node", resource_node)
 
     g.add_edge(START, "rewrite_node")
     g.add_edge("rewrite_node", "domain_router_node")
     g.add_edge("domain_router_node", "agent_node")
     g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": END})
-    g.add_conditional_edges("tools", _after_tools, {"rewrite": "rewrite_node", "end": END})
+    g.add_conditional_edges("tools", _after_tools, {"resource": "resource_node", "rewrite": "rewrite_node", "end": END})
+    g.add_edge("resource_node", "rewrite_node")
 
     return g.compile()
 
