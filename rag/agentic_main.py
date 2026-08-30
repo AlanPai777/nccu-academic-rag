@@ -436,7 +436,22 @@ def resource_node(state: AgenticState) -> dict:
     form_ids = [f.strip() for f in m.group(1).split(",")]
     relevant_ids = _judge_forms(state["query"], form_ids, str(last.content))
     results = [get_form_tool.invoke({"form_id": fid}) for fid in relevant_ids]
-    combined = "[表單全文，系統偵測到表單編號後自動抓取，請直接引用其中的流程/站點/費用等細節]\n\n" + "\n\n".join(results)
+    combined = "\n\n".join(results)
+
+    # Cross-reference pass: a fetched form's own text can reference another
+    # form_id never mentioned on the original page -- extract_form_ids() was
+    # only ever run on get_page_tool's page text, never on resource_node's
+    # own fetched content, so that reference was invisible and never got a
+    # chained fetch. Bounded to a single extra pass (not recursive) to keep
+    # this deterministic node's cost bounded; no case observed yet needing a
+    # deeper chain, and re-running _judge_forms keeps the same relevance
+    # reasoning applied to newly-discovered ids, not a blind fetch-all.
+    new_ids = [f for f in extract_form_ids(combined) if f not in relevant_ids]
+    if new_ids:
+        new_relevant = _judge_forms(state["query"], new_ids, combined)
+        combined += "\n\n" + "\n\n".join(get_form_tool.invoke({"form_id": fid}) for fid in new_relevant)
+
+    combined = "[表單全文，系統偵測到表單編號後自動抓取，請直接引用其中的流程/站點/費用等細節]\n\n" + combined
     offices = _detect_offices(combined)
     if offices:
         combined += f"\n\n[偵測到辦公室: {', '.join(offices)}]"
