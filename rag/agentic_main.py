@@ -66,7 +66,7 @@ _MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see 
 
 # Known office mandates -- deliberately incomplete (only core offices seen in
 # testing so far). Other subdomains show "尚無職掌描述" in domain_router_node's
-# candidate message; see docs/phase_g_clean_pipeline_design.md §B.4.
+# candidate message.
 _SUBDOMAIN_DESC = {
     "aca": "教務處：負責註冊/學籍/畢業/休復學等",
     "osa": "學務處：負責宿舍/獎學金/社團等",
@@ -149,28 +149,55 @@ _FORM_JUDGE_PROMPT = """你要判斷回答這個問題需不需要抓取特定�
 
 只回傳需要抓取的表單編號，用逗號分隔；如果都不需要，回傳「無」。不要有其他文字。"""
 
-_AGENT_SYSTEM = """你是政大學務問答系統的搜尋agent，任務是找到能回答使用者問題的頁面內容，並用找到的內容回答問題。
+_OFFICE_JUDGE_PROMPT = """以下文字裡可能提到了一些政大的辦公室/單位，但提到的名稱常常是簡稱或口語說法，不一定是正式全名（例如文字裡寫「住宿組」，正式全名可能是「住宿輔導組」；文字裡寫「圖書館」，正式全名可能是「圖書館(各組聯絡資訊)」）。
 
-你必須使用search_texts/grep_texts/get_page/extract_links/get_form等工具搜尋政大官方資料來回答問題，絕對不可以直接用自己的知識回答，因為政大的規定可能隨時變動，你的訓練知識可能過時或不準確。
+文字內容：
+{text}
+
+已知的政大辦公室/單位清單（正式名稱，格式為 名稱（所屬subdomain codebase）——這份清單本來就存在，不是搜尋結果）：
+{catalog}
+
+請判斷：上面清單裡，哪些辦公室有在文字內容中被提到（用簡稱、口語說法、或全名都算，只要語意上是指同一個單位就算）？只回傳清單裡列出的正式名稱，用逗號分隔；如果都沒提到，回傳「無」。不要自己發明清單以外的名稱，不要有其他文字。"""
+
+_AGENT_SYSTEM = """你是政大學務問答系統的搜尋agent，任務是找到能回答使用者問題所需的頁面內容。**你不負責撰寫最終答案**——決定不再需要任何工具之後，系統會另外用你已經找到的全部內容生成最終答案，你這一輪的文字回覆不會被使用，不需要在意寫得像不像答案。
+
+你必須使用search_texts/grep_texts/get_page/extract_links/get_form等工具搜尋政大官方資料，絕對不可以直接用自己的知識回答，因為政大的規定可能隨時變動，你的訓練知識可能過時或不準確。
 
 **重要規則**：search_texts或grep_texts回傳的候選只有標題跟預覽，不是完整內容。如果剛找到一個看起來有希望的候選（標題主題相符），下一步幾乎都該是對那個候選的URL呼叫get_page取得全文，不要對同一個主題再搜一次或改搜候選的標題文字——只有get_page才能真正確認候選內容對不對。只有在get_page讀完全文、確認這個候選不是答案（且內文沒有指向其他文件的線索）時，才考慮換關鍵字重新搜尋。
 
-如果你已經有足夠資訊能回答原始問題了，不要呼叫任何工具，但你的文字回覆本身就必須「是」完整答案——直接寫出具體的申請流程/條件/期限等實際內容並附來源URL，不要寫「我會列出...」「我將說明...」這種描述你打算做什麼的句子，那不是答案，是你還沒寫答案。
+如果你判斷目前已經找到的內容已經足夠回答原始問題，不要呼叫任何工具，直接判斷「夠了」即可——不需要自己組織成答案文字。
 
 **自動化機制說明（系統自動觸發，非你主動呼叫，不需要採取行動，只需要正確使用結果）**：
-- 當get_page的回傳裡出現「[偵測到表單編號: ...]」標記時，系統會自動完整抓取該表單全文並附加進對話——這一步已經被系統接管，你不需要（也不會被要求）自己呼叫get_form。procedure頁面的文字敘述常常只是概略帶過，實際細節（蓋章站點、費用/退費標準、資格條件等，類型不固定）常常只寫在表單裡；自動附加的內容會標示為「[表單全文...]」開頭，直接讀取使用即可。
-- 如果自動附加的表單全文裡提到辦公室名稱，系統會接著自動查詢這些辦公室的聯絡資訊（姓名/分機/樓層）並附加進對話，標示為「[辦公室聯絡資訊...]」開頭——同樣不需要你採取任何行動，直接引用即可。
-- 這兩步是循序自動觸發的：先確認表單全文，才會接著查辦公室聯絡資訊。若問題只是單純問「在哪裡下載」，get_page看到的markdown連結本身已經是答案，不需要等待表單全文才能回答。
+- 當get_page的回傳裡出現「[偵測到表單編號: ...]」標記時，系統會自動完整抓取該表單全文並附加進對話——這一步已經被系統接管，你不需要（也不會被要求）自己呼叫get_form。procedure頁面的文字敘述常常只是概略帶過，實際細節（蓋章站點、費用/退費標準、資格條件等，類型不固定）常常只寫在表單裡；自動附加的內容會標示為「[表單全文...]」開頭。
+- 如果自動附加的表單全文裡提到辦公室名稱，系統會接著自動查詢這些辦公室的聯絡資訊（姓名/分機/樓層）並附加進對話，標示為「[辦公室聯絡資訊...]」開頭——同樣不需要你採取任何行動。
+- 這兩步是循序自動觸發的：先確認表單全文，才會接著查辦公室聯絡資訊。若問題只是單純問「在哪裡下載」，get_page看到的markdown連結本身已經是答案，不需要等待表單全文才能判斷夠了。
 
-**範例1：get_page讀完全文後，內容確實回答了問題，該直接作答**
+**範例1：get_page讀完全文後，內容確實回答了問題，該判斷「夠了」，不要繼續呼叫工具**
 情境：問題是「如何辦理休學」，你已經呼叫get_page讀到「休學規定」頁面全文，內容包含申請方式、時間、費用等。
-正確做法：不呼叫任何工具，直接輸出：「辦理休學的流程如下：1. 填寫休學申請書...2. ...（實際列出全文裡的具體條文內容）...來源：[URL]」
-錯誤做法：輸出「我已經取得完整內容，將列出休學的申請條件、辦理流程...」——這只是描述你打算做什麼，沒有把內容本身寫出來，等於還沒回答。
+正確做法：不呼叫任何工具——已經找到的內容會交給系統的合成步驟去寫成答案。
+錯誤做法：繼續呼叫get_page/grep_texts等工具去「補強」答案的寫法或措辭——你的職責在找到內容就結束，不是在意最終文字怎麼寫。
 
-**範例2：問題裡有身分/情境修飾詞，搜尋2-3次仍找不到該修飾詞的專屬規定時，該用一般規則作答並誠實註明**
+**範例2：問題裡有身分/情境修飾詞，搜尋2-3次仍找不到該修飾詞的專屬規定時，該判斷「夠了」**
 情境：問題是「在職生怎麼辦理復學」，你已經get_page讀到一般性的「復學」規定頁面（沒有特別提到「在職生」），也嘗試搜尋「在職生 復學」「在職生」等詞2-3次都找不到專屬於在職生的特殊規定。
-正確做法：不要再繼續搜尋，直接用已有的一般復學規定作答，並加一句「未查到在職生專屬的特殊規定，以下為一般復學流程」。
-錯誤做法：持續換不同關鍵字搜尋超過2-3次仍找不到，既不作答也不停止——這是在浪費輪次，一般規則沒有明確排除某身分時，適用一般規則是合理的假設，比無限期搜尋更有用。"""
+正確做法：不要再繼續搜尋，判斷「夠了」——合成步驟會依已找到的一般規定作答，並視情況誠實註明未查到專屬規定。
+錯誤做法：持續換不同關鍵字搜尋超過2-3次仍找不到，也不判斷「夠了」——這是在浪費輪次，一般規則沒有明確排除某身分時，適用一般規則是合理的假設，比無限期搜尋更有用。"""
+
+_SYNTHESIS_PROMPT = """你是政大學務問答系統的最終答案撰寫者，讀取以下對話歷史（已找到的頁面內容、表單全文、辦公室聯絡資訊），撰寫一則完整、有根據的答案。
+
+原始問題：{query}
+
+對話歷史（含已抓取的頁面/表單全文、辦公室聯絡資訊全文）：
+{history}
+
+撰寫規則：
+1. 直接寫出答案本身，不要描述你打算做什麼；具體引用找到的內容（流程步驟、費用、期限、表單連結等）。
+2. 如果對話歷史裡有【辦公室聯絡資訊】區塊：這是查到的完整名單（每個辦公室可能各有十幾位承辦人），「不是要求全部列出」指的是**同一個辦公室內部**不用把整份名冊都塞進答案，不是指可以跳過整個辦公室。**這個區塊裡列出的每一個辦公室，只要有回傳承辦人資料，都必須在答案對應的段落/站點附上聯絡人——這是完整性要求，不是「挑幾個看起來最相關的」篩選**（跟蓋章站點清單「全部都要列出」是同一個道理，缺一個辦公室的聯絡人跟漏掉一個蓋章站點是同等級的錯誤）。若某個辦公室在名單裡但完全沒有回傳任何人員資料（例如只有辦公室名稱、無姓名），該站可以只標註樓層/分機、註明查無承辦人資訊，不要跳過整站不提。
+
+   格式：對每個有資料的辦公室，從其名單裡挑選最相關的1-2位承辦人（同一辦公室內部才需要篩選，不是辦公室之間篩選）：
+   `姓名（職責）分機XXXXX——選擇原因：[一句話，例如「負責最終核准」「第一線受理窗口」「這是唯一列出分機的聯絡人」]`
+   選擇原因必須具體對應這個人的職責欄位或這題的辦理流程，不能只寫「相關人員」這種空話。如果內容顯示某個步驟需要多層審核（例如先由承辦人受理，再經組長、單位主管逐層簽核），把實際涉及的每一層都列出來、每層各自附上選擇原因，不要只挑一位；如果只是單純的一般承辦窗口，列1-2位最相關的即可。**承辦人姓名是必填項目，不能只寫辦公室名稱、樓層、分機。**
+3. 如果對話歷史顯示已經搜尋多次仍找不到某個細節，誠實說明未查到，不要杜撰。
+4. 回答最後附上來源URL。"""
 
 
 def _rewrite_query(text: str) -> str:
@@ -190,6 +217,21 @@ def _judge_candidates(query: str, candidates: list[dict]) -> dict:
         return json.loads(raw[start:end])
     except (ValueError, json.JSONDecodeError):
         return {"good_enough": None, "selected_index": None, "reason": f"JSON解析失敗: {raw[:200]}"}
+
+
+def _render_full_messages(messages: list) -> str:
+    """Full-text renderer for synthesis_node -- unlike _render_messages()
+    below (deliberately compact one-liners, used by rewrite_node to decide
+    what to search next), synthesis needs the actual page/form/contact
+    content verbatim, not a summary; truncating here would silently drop
+    the exact names/numbers synthesis is supposed to cite. Includes
+    ToolMessage (get_page/get_form/grep results) and HumanMessage
+    (resource_node/contact_node's injected content, domain_router_node's
+    candidate list, rewrite_node's own prompts) -- everything except
+    SystemMessage/AIMessage, since the latter is just the agent's own
+    tool-call decisions, not retrieved content."""
+    parts = [str(m.content) for m in messages if isinstance(m, (ToolMessage, HumanMessage))]
+    return "\n\n---\n\n".join(parts) if parts else "（尚無內容）"
 
 
 def _render_messages(messages: list) -> str:
@@ -350,10 +392,17 @@ def rewrite_node(state: AgenticState) -> dict:
 
 def domain_router_node(state: AgenticState) -> dict:
     """Runs once, right after turn 1's rewrite_node (consumes its cleaned
-    `rewritten` output, not the raw query -- see phase_g_clean_pipeline_design.md
-    §A). No-ops whenever subdomain_hint is already truthy, which both
-    preserves an explicit --subdomain CLI override and makes this node
-    effectively execute only once despite sitting in the every-turn loop."""
+    `rewritten` output, not the raw query). No-ops whenever subdomain_hint
+    is already truthy, which both preserves an explicit --subdomain CLI
+    override and makes this node effectively execute only once despite
+    sitting in the every-turn loop. Deliberately carries no query_type
+    check of its own (docs/phase_g_clean_pipeline_design.md §M D1,
+    2026-08-30 clarification) -- it currently only gets reached via the
+    knowledge/procedure path because Plan_node routes CONTACT/RESOURCE
+    elsewhere, not because this node restricts itself to those types. That
+    distinction matters once self_eval_node's 情況B exists: it may route an
+    arbitrary query back into the main loop regardless of its original
+    Plan_node classification, and this node must keep working for it."""
     if state.get("subdomain_hint"):
         return {}
 
@@ -382,14 +431,35 @@ def domain_router_node(state: AgenticState) -> dict:
 
 
 def agent_node(state: AgenticState) -> dict:
+    """Tool-selection only (2026-08-30 split) -- this used to also double as
+    the final-answer generator (via resp.content) whenever it decided no
+    more tools were needed, sharing _AGENT_SYSTEM (a tool-selection-oriented
+    prompt) for both concerns. That meant synthesis-specific rules (mandatory
+    contact names, how to pick from a large roster with a stated reason)
+    had nowhere to live, since _AGENT_SYSTEM was never the right prompt for
+    them. Now: when _after_agent sees no tool_calls, it routes to
+    synthesis_node instead of END -- this response's .content is discarded
+    (still generated as a side effect of the bind_tools() call, just never
+    read; not worth a separate tool-choice-only call shape for this)."""
     messages = state["messages"]
     if not any(isinstance(m, SystemMessage) for m in messages):
         messages = [SystemMessage(content=_AGENT_SYSTEM)] + messages
     resp = _llm_with_tools.invoke(messages)
-    result: dict = {"messages": [resp]}
-    if not resp.tool_calls:
-        result["answer"] = resp.content
-    return result
+    return {"messages": [resp]}
+
+
+def synthesis_node(state: AgenticState) -> dict:
+    """Dedicated final-answer generation (2026-08-30 addition, adapted from
+    production's rag/nodes/synthesis.py's _SYNTHESIS_PROMPT) -- makes ONE
+    call with a synthesis-specific prompt over the full message history
+    (_render_full_messages(), not the compact _render_messages() rewrite_node
+    uses), so contact-name/roster-selection rules have a dedicated home
+    instead of being crammed into _AGENT_SYSTEM alongside tool-selection
+    instructions."""
+    history = _render_full_messages(state["messages"])
+    prompt = _SYNTHESIS_PROMPT.format(query=state["query"], history=history)
+    answer = simple_chat(messages=[{"role": "user", "content": prompt}])
+    return {"answer": answer}
 
 
 def _after_agent(state: AgenticState) -> str:
@@ -415,17 +485,31 @@ _OFFICE_MARKER_RE = re.compile(r"\[偵測到辦公室: ([^\]]+)\]")
 
 
 def _detect_offices(text: str) -> list[str]:
-    """Deterministic substring scan against the same 433-entry office
-    keyword table domain_router.py's Layer 1 uses (sorted longest-name-
-    first). Unlike _layer1_match() (returns the single first hit), this
-    collects ALL matches, skipping any name that's a substring of an
-    already-collected (longer) match to avoid redundant parent+child
-    office pairs (e.g. "教務處" once "教務處註冊組" is already found)."""
-    found: list[str] = []
-    for name, _sub in _keyword_table():
-        if name in text and not any(name in f for f in found):
-            found.append(name)
-    return found
+    """LLM-judged semantic match against the full ~433-entry office catalog
+    (domain_router.py's _keyword_table()) -- replaces a pure substring scan
+    (2026-08-30 redesign). A form/page refers to offices colloquially
+    ("住宿組") while the catalog carries official full names ("住宿輔導
+    組") -- these share no contiguous substring, so no fixed-string match
+    would ever catch it. A first fix attempt hardcoded a small alias table
+    (~9 entries) -- rejected (2026-08-30, user correction): that's the same
+    whack-a-mole pattern this project has rejected before (_STRIP_RE, 範例
+    3/4), covering only offices someone happened to notice were broken,
+    needing endless future patching for every other short/full-name
+    mismatch. "Does this text refer to the same office as this catalog
+    entry" is a semantic judgment, not an objective check -- LLM territory,
+    same reasoning as _judge_forms(). Catalog is NOT subdomain-scoped: a
+    single form/page can reference offices across multiple subdomains (an
+    aca form's station list can include an osa office), so narrowing to one
+    subdomain here would silently drop cross-subdomain office mentions."""
+    catalog = _keyword_table()
+    if not catalog:
+        return []
+    catalog_str = "\n".join(f"- {name}（{sub}）" for name, sub in catalog)
+    prompt = _OFFICE_JUDGE_PROMPT.format(text=text, catalog=catalog_str)
+    raw = simple_chat(messages=[{"role": "user", "content": prompt}], max_tokens=300).strip()
+    valid_names = {name for name, _sub in catalog}
+    candidates = [n.strip() for n in re.split(r"[,，]", raw)]
+    return [n for n in dict.fromkeys(candidates) if n in valid_names]
 
 
 def _list_forms_metadata(subdomain_hint: str | None) -> list[dict]:
@@ -633,16 +717,18 @@ def build_graph():
     g.add_node("tools", ToolNode(TOOLS))
     g.add_node("resource_node", resource_node)
     g.add_node("contact_node", contact_node)
+    g.add_node("synthesis_node", synthesis_node)
 
     g.add_edge(START, "plan_node")
     g.add_conditional_edges("plan_node", _after_plan,
                              {"knowledge": "rewrite_node", "resource": "resource_node", "contact": "contact_node"})
     g.add_edge("rewrite_node", "domain_router_node")
     g.add_edge("domain_router_node", "agent_node")
-    g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": END})
-    g.add_conditional_edges("tools", _after_tools, {"resource": "resource_node", "contact": "contact_node", "rewrite": "rewrite_node", "end": END})
+    g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": "synthesis_node"})
+    g.add_conditional_edges("tools", _after_tools, {"resource": "resource_node", "contact": "contact_node", "rewrite": "rewrite_node", "end": "synthesis_node"})
     g.add_conditional_edges("resource_node", _after_resource, {"contact": "contact_node", "rewrite": "rewrite_node"})
     g.add_edge("contact_node", "rewrite_node")
+    g.add_edge("synthesis_node", END)
 
     return g.compile()
 

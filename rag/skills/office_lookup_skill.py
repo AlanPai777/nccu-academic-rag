@@ -372,13 +372,24 @@ def _load_contacts_index() -> dict[str, list[dict]]:
 def dynamic_contacts_for_office(office: str) -> list[dict]:
     """
     Primary contact lookup for `office` (Phase F condition 4) — queries
-    office_contacts_index.jsonl via _OFFICE_NAME_MAP, parses each matching
-    record's raw text, and merges results (deduped by extension). Returns []
-    if the office isn't in _OFFICE_NAME_MAP or none of its mapped records
-    parse to anything — caller falls back to KNOWN_CONTACTS in that case.
+    office_contacts_index.jsonl, parses each matching record's raw text, and
+    merges results (deduped by extension). Returns [] if `office` resolves
+    to no records at all — caller falls back to KNOWN_CONTACTS in that case.
+
+    `office` is tried two ways (2026-08-30, agentic_main.py integration):
+    1. As a literal record name already present in the index -- e.g. what
+       agentic_main.py's _detect_offices() now passes: an LLM-resolved
+       match against the FULL catalog ("住宿輔導組"), not a hardcoded
+       alias, so it's already the exact key this index is stored under.
+    2. Falling back to _OFFICE_NAME_MAP -- the original path, for callers
+       passing one of the ~9 short canonical names ("住宿組") this map
+       covers. Kept for backward compatibility with existing callers; not
+       extended further, since maintaining that map for every possible
+       short/full-name pair is exactly the whack-a-mole pattern path 1
+       exists to avoid.
     """
     index = _load_contacts_index()
-    record_names = _OFFICE_NAME_MAP.get(office, [])
+    record_names = [office] if office in index else _OFFICE_NAME_MAP.get(office, [])
 
     contacts: list[dict] = []
     seen_exts: set[str] = set()
