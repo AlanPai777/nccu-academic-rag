@@ -28,11 +28,13 @@ Usage:
 
 from __future__ import annotations
 
+import glob
 import json
 import operator
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
@@ -54,8 +56,10 @@ from rag.agent_tools import (
     extract_links as _extract_links_raw,
     get_form as _get_form_raw,
     extract_form_ids,
+    CRAWLER_OUTPUT,
 )
 from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous, _keyword_table
+from rag.router import route as _classify_query
 
 FTS_DB = "rag/fts_proto3.db"
 _MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see _after_agent
@@ -79,6 +83,7 @@ OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 class AgenticState(TypedDict):
     query: str
     subdomain_hint: str | None
+    query_type: str | None
     turn: int
     rewritten: str
     stuck_turns: int
@@ -130,14 +135,19 @@ _JUDGE_PROMPT = """你是搜尋結果的「起點頁面」判官，不是最終�
 {{"good_enough": true 或 false, "selected_index": 找到的候選頁面編號(從1開始；若good_enough為false則填null), "reason": "一句話說明"}}
 """
 
-_FORM_JUDGE_PROMPT = """一個頁面提到了多個表單編號，但不是每個都跟使用者的問題直接相關——頁面常常會列出同一程序底下不同情境適用的表單（例如某個表單只有特定身分或特定子情境才需要），只有跟問題直接相關的才需要抓取全文查看細節。
+_FORM_JUDGE_PROMPT = """你要判斷回答這個問題需不需要抓取特定表單的全文，以及該抓哪一份。
 
 使用者問題：{query}
 
-偵測到的表單（含頁面上出現該編號附近的文字，供你判斷這個表單是做什麼用的）：
-{snippets}
+目前已有的內容（可能是已抓取的頁面/表單全文，也可能還沒有任何內容）：
+{context}
 
-請判斷哪些表單編號需要抓取全文才能回答這個問題。只回傳需要的表單編號，用逗號分隔，不要有其他文字。如果不確定，寧可保留（不確定是否需要時，該表單也算需要）。"""
+已知的表單清單（含表單編號、標題、用途說明、承辦單位——這份清單本來就存在，不是搜尋結果）：
+{forms}
+
+請判斷：這份表單清單裡，有沒有表單是回答這題需要抓取全文查看細節的？頁面敘述常常只是概略帶過，實際細節（蓋章站點、費用標準、資格條件等）常常只寫在表單裡；但也可能已有內容已經足夠，不需要任何表單。
+
+只回傳需要抓取的表單編號，用逗號分隔；如果都不需要，回傳「無」。不要有其他文字。"""
 
 _AGENT_SYSTEM = """你是政大學務問答系統的搜尋agent，任務是找到能回答使用者問題的頁面內容，並用找到的內容回答問題。
 
@@ -300,6 +310,34 @@ _llm_with_tools = _llm.bind_tools(TOOLS)
 
 # ── Nodes ────────────────────────────────────────────────────────────────
 
+def plan_node(state: AgenticState) -> dict:
+    """D1 (docs/phase_g_clean_pipeline_design.md §M): classification layer
+    reusing router.py's existing 2-layer keyword->LLM classifier -- not a
+    new classifier, the exact one already validated in production. Per D2,
+    PROCEDURE and KNOWLEDGE are NOT different graph paths; the label is
+    recorded for logging/self_eval only and both fall through to the same
+    default branch (_after_plan). CONTACT/RESOURCE get a genuine direct
+    route straight to contact_node/resource_node, skipping rewrite_node/
+    domain_router_node/search_texts/agent_node entirely. This works without
+    those two nodes needing any special-cased "how was I entered" logic:
+    resource_node/contact_node each read whatever context is currently in
+    state["messages"] (empty here, since the main loop never ran) and reason
+    over that -- an empty context is just an input to their existing LLM
+    judgment (resource_node) / deterministic scan (contact_node), not a
+    separate code path (2026-08-30 redesign)."""
+    result = _classify_query(state["query"], use_llm_fallback=True)
+    return {"query_type": result.query_type.value}
+
+
+def _after_plan(state: AgenticState) -> str:
+    qt = state.get("query_type")
+    if qt == "contact":
+        return "contact"
+    if qt == "resource":
+        return "resource"
+    return "knowledge"  # procedure + knowledge share one path, per D2
+
+
 def rewrite_node(state: AgenticState) -> dict:
     turn = state.get("turn", 0) + 1
     messages = state.get("messages", [])
@@ -390,66 +428,105 @@ def _detect_offices(text: str) -> list[str]:
     return found
 
 
-def _judge_forms(query: str, form_ids: list[str], context_text: str) -> list[str]:
-    """LLM judges which detected form_ids are actually relevant to the query
-    before resource_node spends a fetch on each -- a page can list forms for
-    several distinct scenarios under the same procedure (e.g. a proxy-
-    application form and an early-return form alongside the form the query
-    actually needs), and blindly fetching every one wastes calls and dilutes
-    the final context with content the query never asked about. Uses the
-    text surrounding each form_id's mention in context_text (already fetched
-    by get_page_tool -- no extra fetch needed) as signal, since bare codes
-    like "QP-T01-02-05" carry no semantic information on their own. Skipped
-    entirely when there's only one candidate (nothing to choose between)."""
-    if len(form_ids) <= 1:
-        return form_ids
-    snippets = []
-    for fid in form_ids:
-        i = context_text.find(fid)
-        window = context_text[max(0, i - 80):i + 80] if i >= 0 else "(找不到上下文)"
-        snippets.append(f"- {fid}：...{window}...")
-    prompt = _FORM_JUDGE_PROMPT.format(query=query, snippets="\n".join(snippets))
-    raw = simple_chat(messages=[{"role": "user", "content": prompt}], max_tokens=100).strip()
-    selected = [fid for fid in form_ids if fid in raw]
-    return selected or form_ids  # parse failure / no match -> safe default is fetch all
+def _list_forms_metadata(subdomain_hint: str | None) -> list[dict]:
+    """Reads supplementary_map.json's own records directly -- form_id/
+    form_title/form_description/form_unit already exist there for every
+    form (confirmed non-empty, real data: e.g. aca's QP-K13-00-03 carries
+    "包含中正圖書館...之場地借用申請" as form_description). This is a
+    bounded lookup over already-indexed metadata, NOT a search capability --
+    resource_node must not have one (2026-08-30 correction: it "早就有能力
+    判斷休學表單是什麼，因為他都是讀取extracted_supplementary.jsonl設計
+    的" -- the data needed to judge relevance was already sitting there,
+    no FTS5/page search required). Scoped to subdomain_hint's own file when
+    given (~20-40 forms per subdomain); globs all subdomains only when no
+    hint exists yet (still just reading existing files, not searching)."""
+    pattern = (f"{CRAWLER_OUTPUT}/{subdomain_hint}/supplementary_map.json"
+               if subdomain_hint else f"{CRAWLER_OUTPUT}/*/supplementary_map.json")
+    forms: list[dict] = []
+    for path in glob.glob(pattern):
+        try:
+            for r in json.loads(Path(path).read_text()):
+                fid = r.get("form_id")
+                if fid:
+                    forms.append({
+                        "form_id": fid,
+                        "title": r.get("form_title", ""),
+                        "description": r.get("form_description", ""),
+                        "unit": r.get("form_unit", ""),
+                    })
+        except (json.JSONDecodeError, OSError):
+            pass
+    return forms
+
+
+def _judge_forms(query: str, context_text: str, subdomain_hint: str | None) -> list[str]:
+    """Single unified judgment step, used identically no matter how
+    resource_node was entered (2026-08-30 redesign, replacing what used to
+    be two separate code paths -- a regex marker-scan branch and a full
+    anchor-page-search branch -- with one LLM call that always sees the same
+    two inputs: whatever context_text is currently available (may be "" --
+    the judge handles that naturally in its own prompt, no branching needed
+    in the caller) and the full known-forms metadata list
+    (_list_forms_metadata() -- a bounded lookup, never a search). A raw
+    RESOURCE query like "休學申請表在哪裡下載" never contains a form_id as
+    a literal substring the way a CONTACT query contains an office name, so
+    unlike _detect_offices() this can't be a plain substring scan -- but it
+    also doesn't need search, because the candidate list (every form's
+    title/description/unit) is already sitting in supplementary_map.json."""
+    scope = subdomain_hint or _layer1_match(query)
+    forms = _list_forms_metadata(scope)
+    if not forms:
+        return []
+    forms_str = "\n".join(f"- {f['form_id']}：{f['title']}（{f['unit']}）{f['description']}" for f in forms)
+    prompt = _FORM_JUDGE_PROMPT.format(
+        query=query,
+        context=context_text if context_text else "（尚無內容）",
+        forms=forms_str,
+    )
+    raw = simple_chat(messages=[{"role": "user", "content": prompt}], max_tokens=150).strip()
+    valid_ids = {f["form_id"] for f in forms}
+    return [fid for fid in valid_ids if fid in raw]
 
 
 def resource_node(state: AgenticState) -> dict:
-    """Deterministically triggered by _after_tools when the last ToolMessage
-    carries a "[偵測到表單編號: ...]" marker (set by get_page_tool) -- not an
-    agent-selected tool_call, so no agent has veto power over *whether* this
-    node runs (per docs/phase_g_clean_pipeline_design.md §M D3/D6, an
-    objective trigger stays deterministic). *Which* of the detected forms
-    are worth fetching is a genuine content-relevance judgment, though, so
-    that part goes through _judge_forms() rather than blindly fetching every
-    detected id. Fetches each judged-relevant form's full content via the
-    existing get_form_tool logic (no duplication), then scans the fetched
-    content for office names (§M D4)
-    so _after_resource can decide whether to chain into contact_node.
-    Hands back a HumanMessage -- same pattern as domain_router_node, since
-    this isn't a response to any AIMessage tool_call and so can't
-    legitimately be a ToolMessage."""
-    last = state["messages"][-1]
-    m = _FORM_MARKER_RE.search(str(last.content))
-    if not m:
+    """Deterministically routed here by either _after_tools (marker found on
+    a ToolMessage) or _after_plan (Plan_node classified the query RESOURCE
+    directly) -- both are the objective gate (§M D3/D6); this node itself no
+    longer re-derives "how did I get here" via marker regex vs empty-
+    messages branching (2026-08-30 redesign -- that branching was doing the
+    same underlying judgment three different ways in code instead of once
+    via a prompt). One code path: read whatever context_text is currently
+    available (the last message's content, or "" if this is the direct
+    Plan_node route), hand it to _judge_forms() along with the query --
+    that single LLM call decides which form(s), if any, are worth fetching,
+    using the full known-forms metadata list rather than a page search (see
+    _list_forms_metadata()/_judge_forms() docstrings). Fetches each judged-
+    relevant form's full content via the existing get_form_tool logic (no
+    duplication), then scans the fetched content for office names (§M D4)
+    so _after_resource can decide whether to chain into contact_node. Hands
+    back a HumanMessage -- same pattern as domain_router_node, since this
+    isn't a response to any AIMessage tool_call and so can't legitimately be
+    a ToolMessage."""
+    messages = state.get("messages") or []
+    last = messages[-1] if messages else None
+    context_text = str(last.content) if last is not None else ""
+    relevant_ids = _judge_forms(state["query"], context_text, state.get("subdomain_hint"))
+    if not relevant_ids:
         return {}
-    form_ids = [f.strip() for f in m.group(1).split(",")]
-    relevant_ids = _judge_forms(state["query"], form_ids, str(last.content))
+    fetched_ids = set(relevant_ids)
     results = [get_form_tool.invoke({"form_id": fid}) for fid in relevant_ids]
     combined = "\n\n".join(results)
 
     # Cross-reference pass: a fetched form's own text can reference another
-    # form_id never mentioned on the original page -- extract_form_ids() was
-    # only ever run on get_page_tool's page text, never on resource_node's
-    # own fetched content, so that reference was invisible and never got a
-    # chained fetch. Bounded to a single extra pass (not recursive) to keep
-    # this deterministic node's cost bounded; no case observed yet needing a
-    # deeper chain, and re-running _judge_forms keeps the same relevance
-    # reasoning applied to newly-discovered ids, not a blind fetch-all.
-    new_ids = [f for f in extract_form_ids(combined) if f not in relevant_ids]
-    if new_ids:
-        new_relevant = _judge_forms(state["query"], new_ids, combined)
-        combined += "\n\n" + "\n\n".join(get_form_tool.invoke({"form_id": fid}) for fid in new_relevant)
+    # form_id never mentioned before -- re-run the SAME judge on the now-
+    # larger context_text (original context + newly fetched form text),
+    # excluding ids already fetched. Bounded to a single extra pass (not
+    # recursive) to keep this deterministic node's cost bounded; no case
+    # observed yet needing a deeper chain.
+    more_ids = [fid for fid in _judge_forms(state["query"], combined, state.get("subdomain_hint"))
+                if fid not in fetched_ids]
+    if more_ids:
+        combined += "\n\n" + "\n\n".join(get_form_tool.invoke({"form_id": fid}) for fid in more_ids)
 
     combined = "[表單全文，系統偵測到表單編號後自動抓取，請直接引用其中的流程/站點/費用等細節]\n\n" + combined
     offices = _detect_offices(combined)
@@ -459,31 +536,42 @@ def resource_node(state: AgenticState) -> dict:
 
 
 def contact_node(state: AgenticState) -> dict:
-    """Deterministically triggered by _after_resource when resource_node's
-    just-fetched form content carries a "[偵測到辦公室: ...]" marker (§M D4).
-    Same no-agent-veto reasoning as resource_node (§M D3/D6). Wraps the
-    existing OfficeLookupSkill batch lookup -- this is a genuinely new
+    """Deterministically routed here by _after_tools, _after_resource, or
+    _after_plan (§M D3/D4/D6 -- all three are objective gates: a marker on a
+    ToolMessage/HumanMessage, or Plan_node classifying the query CONTACT
+    directly). One code path regardless of which gate routed here
+    (2026-08-30 redesign, same reasoning as resource_node): read whatever
+    context_text is available (last message's content, or the raw query
+    itself if messages is still empty), run the existing deterministic
+    _detect_offices() substring scan against it -- this works identically
+    whether context_text is a fetched form's full text or the bare query
+    "出納組電話幾號", since both are just text to scan. No separate "which
+    mode am I in" branching needed.
+
+    Wraps the existing OfficeLookupSkill batch lookup -- a genuinely new
     capability (no prior tool did batch contact lookup), unlike
     resource_node which just re-routes get_form_tool's existing logic.
 
     Deliberately does NOT run offices through an LLM relevance filter the
-    way resource_node's _judge_forms() filters form_ids -- detected offices
-    come from a form's own station list, and Step 9 (phase_g_clean_pipeline_
-    design.md) already established that stations are a completeness
-    requirement (ALL must appear), not a filterable relevance list. A
-    pre-fetch filter here risks permanently losing a required station's
-    contact info on a bad judgment call, with no fallback (unlike a
-    filtered-out form, whose narrative text usually still covers the
-    basics). Fetching all detected offices is cheap (single batch lookup);
-    any filtering for what actually surfaces in the answer belongs in
+    way resource_node's _judge_forms() filters form_ids -- offices detected
+    from a form's own station list are a completeness requirement (Step 9,
+    phase_g_clean_pipeline_design.md: ALL stations must appear, not a
+    filterable relevance list), and a pre-fetch filter risks permanently
+    losing a required station's contact info on a bad judgment call, with
+    no fallback (unlike a filtered-out form, whose narrative text usually
+    still covers the basics). A direct CONTACT query naming N offices has
+    no such tension either -- naming them means the user wants info on all
+    N. Fetching all detected offices is cheap (single batch lookup); any
+    filtering for what actually surfaces in the answer belongs in
     synthesis, after the data exists (validated by §M D10: the agent
     correctly omitted a full staff roster from a procedure answer while
     keeping station+location, i.e. filter-after-fetch, not filter-before)."""
-    last = state["messages"][-1]
-    m = _OFFICE_MARKER_RE.search(str(last.content))
-    if not m:
+    messages = state.get("messages") or []
+    last = messages[-1] if messages else None
+    context_text = str(last.content) if last is not None else state["query"]
+    offices = _detect_offices(context_text)
+    if not offices:
         return {}
-    offices = [o.strip() for o in m.group(1).split(",")]
     from rag.skills.office_lookup_skill import OfficeLookupSkill
     skill = OfficeLookupSkill()
     result = skill.run(offices)
@@ -523,9 +611,13 @@ def _after_tools(state: AgenticState) -> str:
 def _after_resource(state: AgenticState) -> str:
     """§M D4: resource -> contact is sequential, not parallel -- contact's
     trigger signal only exists once resource_node has actually fetched the
-    form content to scan."""
-    last = state["messages"][-1]
-    if isinstance(last, HumanMessage) and _OFFICE_MARKER_RE.search(str(last.content)):
+    form content to scan. Guards against empty messages: reachable via
+    Plan_node's direct RESOURCE route (D1), where resource_node may judge
+    that no form is needed and return {}, leaving state["messages"] exactly
+    as empty as when this node started."""
+    messages = state.get("messages") or []
+    last = messages[-1] if messages else None
+    if last is not None and isinstance(last, HumanMessage) and _OFFICE_MARKER_RE.search(str(last.content)):
         return "contact"
     return "rewrite"
 
@@ -534,6 +626,7 @@ def _after_resource(state: AgenticState) -> str:
 
 def build_graph():
     g = StateGraph(AgenticState)
+    g.add_node("plan_node", plan_node)
     g.add_node("rewrite_node", rewrite_node)
     g.add_node("domain_router_node", domain_router_node)
     g.add_node("agent_node", agent_node)
@@ -541,7 +634,9 @@ def build_graph():
     g.add_node("resource_node", resource_node)
     g.add_node("contact_node", contact_node)
 
-    g.add_edge(START, "rewrite_node")
+    g.add_edge(START, "plan_node")
+    g.add_conditional_edges("plan_node", _after_plan,
+                             {"knowledge": "rewrite_node", "resource": "resource_node", "contact": "contact_node"})
     g.add_edge("rewrite_node", "domain_router_node")
     g.add_edge("domain_router_node", "agent_node")
     g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": END})
@@ -555,7 +650,7 @@ def build_graph():
 def run(query: str, subdomain_hint: str | None = None, stream: bool = False) -> dict:
     graph = build_graph()
     initial: AgenticState = {
-        "query": query, "subdomain_hint": subdomain_hint, "turn": 0, "rewritten": "",
+        "query": query, "subdomain_hint": subdomain_hint, "query_type": None, "turn": 0, "rewritten": "",
         "stuck_turns": 0, "messages": [], "answer": None,
     }
 
