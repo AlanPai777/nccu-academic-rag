@@ -55,7 +55,7 @@ from rag.agent_tools import (
     get_form as _get_form_raw,
     extract_form_ids,
 )
-from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous
+from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous, _keyword_table
 
 FTS_DB = "rag/fts_proto3.db"
 _MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see _after_agent
@@ -350,6 +350,21 @@ def _after_agent(state: AgenticState) -> str:
 
 
 _FORM_MARKER_RE = re.compile(r"\[偵測到表單編號: ([^\]]+)\]")
+_OFFICE_MARKER_RE = re.compile(r"\[偵測到辦公室: ([^\]]+)\]")
+
+
+def _detect_offices(text: str) -> list[str]:
+    """Deterministic substring scan against the same 433-entry office
+    keyword table domain_router.py's Layer 1 uses (sorted longest-name-
+    first). Unlike _layer1_match() (returns the single first hit), this
+    collects ALL matches, skipping any name that's a substring of an
+    already-collected (longer) match to avoid redundant parent+child
+    office pairs (e.g. "教務處" once "教務處註冊組" is already found)."""
+    found: list[str] = []
+    for name, _sub in _keyword_table():
+        if name in text and not any(name in f for f in found):
+            found.append(name)
+    return found
 
 
 def resource_node(state: AgenticState) -> dict:
@@ -358,16 +373,40 @@ def resource_node(state: AgenticState) -> dict:
     agent-selected tool_call, so no agent has veto power here (per
     docs/phase_g_clean_pipeline_design.md §M D3/D6). Fetches each detected
     form's full content via the existing get_form_tool logic (no
-    duplication) and hands it back as a HumanMessage -- same pattern as
-    domain_router_node, since this isn't a response to any AIMessage
-    tool_call and so can't legitimately be a ToolMessage."""
+    duplication), then scans the fetched content for office names (§M D4)
+    so _after_resource can decide whether to chain into contact_node.
+    Hands back a HumanMessage -- same pattern as domain_router_node, since
+    this isn't a response to any AIMessage tool_call and so can't
+    legitimately be a ToolMessage."""
     last = state["messages"][-1]
     m = _FORM_MARKER_RE.search(str(last.content))
     if not m:
         return {}
     form_ids = [f.strip() for f in m.group(1).split(",")]
     results = [get_form_tool.invoke({"form_id": fid}) for fid in form_ids]
-    return {"messages": [HumanMessage(content="\n\n".join(results))]}
+    combined = "\n\n".join(results)
+    offices = _detect_offices(combined)
+    if offices:
+        combined += f"\n\n[偵測到辦公室: {', '.join(offices)}]"
+    return {"messages": [HumanMessage(content=combined)]}
+
+
+def contact_node(state: AgenticState) -> dict:
+    """Deterministically triggered by _after_resource when resource_node's
+    just-fetched form content carries a "[偵測到辦公室: ...]" marker (§M D4).
+    Same no-agent-veto reasoning as resource_node (§M D3/D6). Wraps the
+    existing OfficeLookupSkill batch lookup -- this is a genuinely new
+    capability (no prior tool did batch contact lookup), unlike
+    resource_node which just re-routes get_form_tool's existing logic."""
+    last = state["messages"][-1]
+    m = _OFFICE_MARKER_RE.search(str(last.content))
+    if not m:
+        return {}
+    offices = [o.strip() for o in m.group(1).split(",")]
+    from rag.skills.office_lookup_skill import OfficeLookupSkill
+    skill = OfficeLookupSkill()
+    result = skill.run(offices)
+    return {"messages": [HumanMessage(content=skill.format_context(result))]}
 
 
 def _after_tools(state: AgenticState) -> str:
@@ -385,6 +424,16 @@ def _after_tools(state: AgenticState) -> str:
     return "rewrite"
 
 
+def _after_resource(state: AgenticState) -> str:
+    """§M D4: resource -> contact is sequential, not parallel -- contact's
+    trigger signal only exists once resource_node has actually fetched the
+    form content to scan."""
+    last = state["messages"][-1]
+    if isinstance(last, HumanMessage) and _OFFICE_MARKER_RE.search(str(last.content)):
+        return "contact"
+    return "rewrite"
+
+
 # ── Graph assembly ───────────────────────────────────────────────────────
 
 def build_graph():
@@ -394,13 +443,15 @@ def build_graph():
     g.add_node("agent_node", agent_node)
     g.add_node("tools", ToolNode(TOOLS))
     g.add_node("resource_node", resource_node)
+    g.add_node("contact_node", contact_node)
 
     g.add_edge(START, "rewrite_node")
     g.add_edge("rewrite_node", "domain_router_node")
     g.add_edge("domain_router_node", "agent_node")
     g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": END})
     g.add_conditional_edges("tools", _after_tools, {"resource": "resource_node", "rewrite": "rewrite_node", "end": END})
-    g.add_edge("resource_node", "rewrite_node")
+    g.add_conditional_edges("resource_node", _after_resource, {"contact": "contact_node", "rewrite": "rewrite_node"})
+    g.add_edge("contact_node", "rewrite_node")
 
     return g.compile()
 
