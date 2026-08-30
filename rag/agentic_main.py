@@ -89,6 +89,7 @@ class AgenticState(TypedDict):
     stuck_turns: int
     messages: Annotated[list, add_messages]
     answer: str | None
+    self_eval_note: str | None
 
 
 # ── Rewrite / judge (unchanged prompts, reused logic) ───────────────────────
@@ -198,6 +199,27 @@ _SYNTHESIS_PROMPT = """你是政大學務問答系統的最終答案撰寫者，
    選擇原因必須具體對應這個人的職責欄位或這題的辦理流程，不能只寫「相關人員」這種空話。如果內容顯示某個步驟需要多層審核（例如先由承辦人受理，再經組長、單位主管逐層簽核），把實際涉及的每一層都列出來、每層各自附上選擇原因，不要只挑一位；如果只是單純的一般承辦窗口，列1-2位最相關的即可。**承辦人姓名是必填項目，不能只寫辦公室名稱、樓層、分機。**
 3. 如果對話歷史顯示已經搜尋多次仍找不到某個細節，誠實說明未查到，不要杜撰。
 4. 回答最後附上來源URL。"""
+
+_SELF_EVAL_PROMPT = """你是品質複核者，任務是判斷這次的回答有沒有問題——不是重新回答問題，只需要判斷。
+
+原始完整問題（可能包含多個子問題，務必對照全文，不要只看其中一部分）：{query}
+
+Plan_node當初的分類：{query_type}
+
+這輪執行過程中，有沒有觸發過表單抓取或辦公室聯絡資訊查詢：{resource_contact_fired}
+
+已讀過的頁面/表單URL：{urls}
+
+最終答案：
+{answer}
+
+請依序判斷：
+1. 如果原始問題其實包含好幾個不同主題的子問題，但答案只回答了其中一部分（例如問題同時問了兩件不同的事，答案只處理了一件）——這代表當初的分類沒有正確處理複合問題，回傳「情況B」。
+2. 如果答案已經完整回答了原始問題的每一部分，回傳「通過」。
+3. 如果分類本身看起來合理，只是內容不夠完整（例如procedure類問題找到了辦理流程，但完全沒有提到表單或聯絡辦公室，而這類問題通常需要）——回傳「情況A」，並具體寫出提醒文字：點名已讀過的URL、還沒呼叫過哪些工具（grep_texts_tool/get_page_tool/get_form_tool），建議下一步怎麼做。提醒文字要具體，不能只寫「請確認答案完整」這種空話。
+
+只回傳一個JSON，不要有其他文字：
+{{"verdict": "通過" 或 "情況A" 或 "情況B", "reminder": "情況A時的具體提醒文字，其他情況留空字串"}}"""
 
 
 def _rewrite_query(text: str) -> str:
@@ -462,6 +484,77 @@ def synthesis_node(state: AgenticState) -> dict:
     return {"answer": answer}
 
 
+_SELF_EVAL_MAX_TURN = 20  # generous risk-only ceiling (not a correctness cap,
+# same philosophy as _MAX_STUCK/removing _MAX_TURNS elsewhere in this file) --
+# self_eval's retry loops (both 情況A and 情況B) route back through
+# rewrite_node, which increments state["turn"] every pass, so this reuses
+# that existing counter instead of inventing a new one just for self_eval.
+
+
+def self_eval_node(state: AgenticState) -> dict:
+    """D7-D9 (docs/phase_g_clean_pipeline_design.md §M, 2026-08-30 design,
+    first implementation): runs once after every synthesis_node call, not
+    gated behind a narrow pre-check -- the original D7 draft only fired when
+    "procedure classified AND resource/contact never triggered," but that
+    signal structurally can't catch D8's own worked example (a cross-type
+    compound query where the procedure half DID trigger resource/contact
+    normally, silently dropping the other half). One LLM call
+    (_SELF_EVAL_PROMPT) judges against the FULL original state["query"]
+    (not a rewritten sub-query) -- this is what lets it catch same-type
+    compound queries that #8 (Plan_node's keyword-type compound detection,
+    still unimplemented) structurally cannot (see design doc's two-layer-
+    defense table). Returns one of: pass (self_eval_note=None), 情況A
+    (content gap -- injects a concrete reminder message and loops back via
+    rewrite_node), 情況B (classification may be wrong -- clears query_type
+    so _after_self_eval routes back to plan_node for reclassification).
+
+    Honest caveat carried over from the design doc: this is still
+    "message hint -> LLM decides whether to act," the same mechanism shape
+    already shown unreliable for _AGENT_SYSTEM's timing clauses -- moving it
+    to a dedicated post-hoc step doesn't guarantee it works better, only
+    that it's now testable in isolation. Not validated beyond compiling and
+    a first smoke-test run at implementation time."""
+    fired = any(
+        isinstance(m, HumanMessage) and ("[表單全文" in str(m.content) or "[辦公室聯絡資訊" in str(m.content))
+        for m in state["messages"]
+    )
+    urls = sorted(_fetched_urls(state["messages"]))
+    prompt = _SELF_EVAL_PROMPT.format(
+        query=state["query"],
+        query_type=state.get("query_type") or "未知",
+        resource_contact_fired="有" if fired else "沒有",
+        urls="、".join(urls) if urls else "（尚無）",
+        answer=state.get("answer") or "（無答案）",
+    )
+    raw = simple_chat(messages=[{"role": "user", "content": prompt}], max_tokens=400)
+    try:
+        start, end = raw.index("{"), raw.rindex("}") + 1
+        result = json.loads(raw[start:end])
+    except (ValueError, json.JSONDecodeError):
+        return {"self_eval_note": None}  # parse failure -> pass through, don't loop on a broken judge call
+
+    verdict = result.get("verdict", "通過")
+    if verdict == "情況A":
+        reminder = (result.get("reminder") or "").strip() or "請確認答案是否完整回應原始問題各部分。"
+        return {"self_eval_note": reminder, "messages": [HumanMessage(content=f"[self_eval提醒] {reminder}")]}
+    if verdict == "情況B":
+        return {
+            "self_eval_note": "self_eval判斷原始問題可能未被正確分類或存在未處理的子問題，重新分類中。",
+            "query_type": None,
+        }
+    return {"self_eval_note": None}
+
+
+def _after_self_eval(state: AgenticState) -> str:
+    if not state.get("self_eval_note"):
+        return "end"
+    if state.get("turn", 0) >= _SELF_EVAL_MAX_TURN:
+        return "end"  # risk-only ceiling, not a correctness judgment
+    if state.get("query_type") is None:
+        return "plan"  # 情況B
+    return "rewrite"  # 情況A
+
+
 def _after_agent(state: AgenticState) -> str:
     # 2026-08-28: _MAX_TURNS hard cap deliberately removed for this experiment
     # -- let the agent decide for itself when it has enough, per the session's
@@ -718,6 +811,7 @@ def build_graph():
     g.add_node("resource_node", resource_node)
     g.add_node("contact_node", contact_node)
     g.add_node("synthesis_node", synthesis_node)
+    g.add_node("self_eval_node", self_eval_node)
 
     g.add_edge(START, "plan_node")
     g.add_conditional_edges("plan_node", _after_plan,
@@ -728,7 +822,8 @@ def build_graph():
     g.add_conditional_edges("tools", _after_tools, {"resource": "resource_node", "contact": "contact_node", "rewrite": "rewrite_node", "end": "synthesis_node"})
     g.add_conditional_edges("resource_node", _after_resource, {"contact": "contact_node", "rewrite": "rewrite_node"})
     g.add_edge("contact_node", "rewrite_node")
-    g.add_edge("synthesis_node", END)
+    g.add_edge("synthesis_node", "self_eval_node")
+    g.add_conditional_edges("self_eval_node", _after_self_eval, {"end": END, "rewrite": "rewrite_node", "plan": "plan_node"})
 
     return g.compile()
 
@@ -737,7 +832,7 @@ def run(query: str, subdomain_hint: str | None = None, stream: bool = False) -> 
     graph = build_graph()
     initial: AgenticState = {
         "query": query, "subdomain_hint": subdomain_hint, "query_type": None, "turn": 0, "rewritten": "",
-        "stuck_turns": 0, "messages": [], "answer": None,
+        "stuck_turns": 0, "messages": [], "answer": None, "self_eval_note": None,
     }
 
     if stream:
