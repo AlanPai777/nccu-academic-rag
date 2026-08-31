@@ -197,14 +197,20 @@ _SYNTHESIS_PROMPT = """你是政大學務問答系統的最終答案撰寫者，
 
 撰寫規則：
 1. 直接寫出答案本身，不要描述你打算做什麼；具體引用找到的內容（流程步驟、費用、期限、表單連結等）。
-2. 如果對話歷史裡有【辦公室聯絡資訊】區塊：這是查到的完整名單（每個辦公室可能各有十幾位承辦人），「不是要求全部列出」指的是**同一個辦公室內部**不用把整份名冊都塞進答案，不是指可以跳過整個辦公室。**這個區塊裡列出的每一個辦公室，只要有回傳承辦人資料，都必須在答案對應的段落/站點附上聯絡人——這是完整性要求，不是「挑幾個看起來最相關的」篩選**（跟蓋章站點清單「全部都要列出」是同一個道理，缺一個辦公室的聯絡人跟漏掉一個蓋章站點是同等級的錯誤）。若某個辦公室在名單裡但完全沒有回傳任何人員資料（例如只有辦公室名稱、無姓名），該站可以只標註樓層/分機、註明查無承辦人資訊，不要跳過整站不提。
+2. 如果問題是「如何辦理OO」這類流程類問題，答案要寫成可以照著操作的流程手冊，不是概略描述。用「第一步、第二步、...」明確分步驟，每一步都要具體回答：
+   (a) 這一步要準備/填寫哪一份表單（附下載連結）；
+   (b) 這份表單本身有沒有需要特別注意的填寫規則或但書——例如需要委託書及受託人證件、需要先繳費單據正本、依申請時間點金額或流程不同、需要先由某處室核章才能到下一個處室辦理等（【表單其他決策/資訊項目，答案應涵蓋】區塊如果有出現，裡面常常就是這類細節，尤其是「先至OO核章、再至OO辦理/繳費」這種跨處室的順序，這是具體操作步驟，必須寫進對應的那一步，不能省略成一句籠統帶過）；
+   (c) 辦完這一步要拿著東西去哪個處室、地點（樓層/門牌，若有查到）；
+   (d) 這個處室的負責人姓名與分機（若【辦公室聯絡資訊】有查到，依規則3列出）。
+   不要只寫「至OO處室辦理」這種空泛描述——要具體到「填寫XX表 → 持表至OO（地點）辦理/由某某人核章 → 再至XX處室繳費」這種可執行的操作順序。單純查資訊/查電話這類非流程類問題不受此規則限制，維持簡潔回答即可。
+3. 如果對話歷史裡有【辦公室聯絡資訊】區塊：這是查到的完整名單（每個辦公室可能各有十幾位承辦人），「不是要求全部列出」指的是**同一個辦公室內部**不用把整份名冊都塞進答案，不是指可以跳過整個辦公室。**這個區塊裡列出的每一個辦公室，只要有回傳承辦人資料，都必須在答案對應的段落/站點附上聯絡人——這是完整性要求，不是「挑幾個看起來最相關的」篩選**（跟蓋章站點清單「全部都要列出」是同一個道理，缺一個辦公室的聯絡人跟漏掉一個蓋章站點是同等級的錯誤）。若某個辦公室在名單裡但完全沒有回傳任何人員資料（例如只有辦公室名稱、無姓名），該站可以只標註樓層/分機、註明查無承辦人資訊，不要跳過整站不提。
 
    格式：對每個有資料的辦公室，從其名單裡挑選最相關的1-2位承辦人（同一辦公室內部才需要篩選，不是辦公室之間篩選）：
    `姓名（職責）分機XXXXX——選擇原因：[一句話，例如「負責最終核准」「第一線受理窗口」「這是唯一列出分機的聯絡人」]`
    選擇原因必須具體對應這個人的職責欄位或這題的辦理流程，不能只寫「相關人員」這種空話。如果內容顯示某個步驟需要多層審核（例如先由承辦人受理，再經組長、單位主管逐層簽核），把實際涉及的每一層都列出來、每層各自附上選擇原因，不要只挑一位；如果只是單純的一般承辦窗口，列1-2位最相關的即可。**承辦人姓名是必填項目，不能只寫辦公室名稱、樓層、分機。**
-3. 如果對話歷史裡有【表單全文】區塊，且裡面包含**兩份以上**表單：這些是`resource_node`偵測到的全部表單，全部抓取、未經相關性篩選（跟D11/contact_node同一個原則：fetch階段不篩，篩選留給你這一步）。**只挑跟原始問題最直接相關的1-2份**引用細節、列出下載連結，其餘不相關情境的表單（例如問題只問休學，卻同時抓到「提早復學申請書」這種不同情境用的表單）不要列出、不要引用其內容——但只有一份表單時，直接使用即可，不需要這條規則。
-4. 如果對話歷史顯示已經搜尋多次仍找不到某個細節，誠實說明未查到，不要杜撰。
-5. 回答最後附上來源URL。"""
+4. 如果對話歷史裡有【表單全文】區塊，且裡面包含**兩份以上**表單：這些是`resource_node`偵測到的全部表單，全部抓取、未經相關性篩選（跟D11/contact_node同一個原則：fetch階段不篩，篩選留給你這一步）。**只挑跟原始問題最直接相關的1-2份**引用細節、列出下載連結，其餘不相關情境的表單（例如問題只問休學，卻同時抓到「提早復學申請書」這種不同情境用的表單）不要列出、不要引用其內容——但只有一份表單時，直接使用即可，不需要這條規則。
+5. 如果對話歷史顯示已經搜尋多次仍找不到某個細節，誠實說明未查到，不要杜撰。
+6. 回答最後附上來源URL。"""
 
 _SELF_EVAL_PROMPT = """你是品質複核者，任務是判斷這次的回答有沒有問題——不是重新回答問題，只需要判斷。
 
@@ -702,7 +708,13 @@ def _judge_forms(query: str, context_text: str, subdomain_hint: str | None) -> l
 
 _STATION_ROLE_RE = re.compile(r'[（(](\d+)[）)]\s*([^\s|]{1,20})')
 _ROLE_KEYWORDS = ['組長', '教務長', '主任', '批示', '核准', '簽核', '審核', '核可', '秘書']
-_CHECKBOX_SKIP_LABELS = {'原因'}  # generic student-fill-in fields, not info the answer should relay
+_CHECKBOX_SKIP_LABELS = {
+    '原因', '性別 Sex', '房間人數 Room Type', '學生身份 Student Category',
+}  # generic student self-declared demographic fields, not decision/routing
+   # info the answer should relay -- confirmed noise via QP-M03-01-04/05
+   # (性別/房間人數 checkboxes were being surfaced alongside the genuinely
+   # useful 500元-delayed-fee routing block); not a complete list, extend
+   # as more forms surface the same kind of identity-field noise.
 
 
 def _extract_station_roles(text: str) -> dict[str, list[str]]:
@@ -769,21 +781,48 @@ def _offices_from_role_keywords(role_cells: list[str]) -> list[str]:
     return found
 
 
+_LABEL_FRAGMENT_MAX_LEN = 6  # e.g. 申請/處理/方式 -- short table-cell labels, not prose
+
+
 def _extract_checklist_blocks(text: str) -> list[dict]:
-    """Deterministic □-option block parser (2026-08-30) -- finds table rows
-    with 2+ checkbox markers and a plausible descriptive label (the other
-    non-□ cell in the same row), for content like pickup-method options
-    that don't map to any office/contact but are still parts of the form a
-    complete answer should mention (confirmed real gap: QP-T01-03-02's
-    領取方式 section, 三個工作天/郵寄/iNCCU options, was never once
-    mentioned in early synthesis_node output despite being fetched).
-    Filters out obvious student-fill-in fields via _CHECKBOX_SKIP_LABELS
-    (a short generic label like "原因") or a missing label entirely (e.g.
-    the 學士班/碩士班/博士班 degree-level checkboxes have no descriptive
-    label in the same row) -- NOT a complete filter, may need iteration
-    against more forms; flagged honestly rather than assumed correct."""
+    """Deterministic □-option block parser. Two passes, because forms
+    linearize their HTML tables into markdown rows in two different shapes:
+
+    Pass 1 (2026-08-30): a SINGLE line with 2+ checkbox markers and a
+    plausible descriptive label in the SAME row -- works when the label
+    and all its choices survive extraction on one row (e.g. 休學's
+    領取方式 line: label + 三個工作天/郵寄/iNCCU all on one line;
+    confirmed real gap when this was missing: QP-T01-03-02's pickup-method
+    section was never once mentioned in early synthesis_node output
+    despite being fetched).
+
+    Pass 2 (2026-08-31, added after a 退宿規定 case this pass 1 silently
+    dropped): some forms' tables instead linearize a merged/vertical label
+    cell into SEPARATE short rows, each paired with its OWN single-□
+    option row -- confirmed via QP-M03-01-04's 500元 delayed-fee option,
+    whose label "申請/處理/方式" is split across 3 separate rows, each
+    row carrying exactly one □ option. Pass 1's "2+ □ on one line"
+    requirement never matches this shape at all, and that option happened
+    to carry a routing instruction found nowhere else in the form
+    (請先至住宿組核章後，再至出納組繳費) -- losing it silently drops a
+    genuine procedural step, not just a paraphrase-able choice. Pass 2
+    groups RUNS of consecutive lines that are each either a single-□
+    option or a short label fragment (<=6 chars) into one block; any other
+    line (blank row, a numbered station marker, long prose) ends the run.
+    A run needs 2+ □ lines before being kept, matching pass 1's own bar
+    for "a real multi-option choice, not a lone checkbox".
+
+    Both passes filter obvious student-fill-in fields via
+    _CHECKBOX_SKIP_LABELS (a short generic label like "原因") or a missing
+    label entirely (e.g. degree-level 學士班/碩士班/博士班 checkboxes with
+    no descriptive label in the same row) -- NOT a complete filter, may
+    need further iteration against more forms; flagged honestly rather
+    than assumed correct."""
     blocks = []
-    for line in text.split('\n'):
+    claimed_lines: set[int] = set()
+    lines = text.split('\n')
+
+    for i, line in enumerate(lines):
         if line.count('□') < 2:
             continue
         cells = [c.strip() for c in line.split('|') if c.strip()]
@@ -792,6 +831,36 @@ def _extract_checklist_blocks(text: str) -> list[dict]:
         if label is None or label in _CHECKBOX_SKIP_LABELS:
             continue
         blocks.append({"label": label, "options": options})
+        claimed_lines.add(i)
+
+    group_options: list[str] = []
+    group_labels: list[str] = []
+
+    def _flush() -> None:
+        if len(group_options) >= 2:
+            label = ''.join(group_labels) if group_labels else '（表單勾選項目）'
+            if label not in _CHECKBOX_SKIP_LABELS:
+                blocks.append({"label": label, "options": ' '.join(group_options)})
+        group_options.clear()
+        group_labels.clear()
+
+    for i, line in enumerate(lines):
+        if i in claimed_lines or '|' not in line:
+            _flush()
+            continue
+        cells = [c.strip() for c in line.split('|') if c.strip()]
+        if line.count('□') == 1:
+            group_options.append(next(c for c in cells if '□' in c))
+            for c in cells:
+                if '□' not in c and 0 < len(c) <= _LABEL_FRAGMENT_MAX_LEN and c not in group_labels:
+                    group_labels.append(c)
+            continue
+        if line.count('□') == 0 and len(cells) == 1 and 0 < len(cells[0]) <= _LABEL_FRAGMENT_MAX_LEN:
+            if cells[0] not in group_labels:
+                group_labels.append(cells[0])
+            continue
+        _flush()
+    _flush()
     return blocks
 
 
