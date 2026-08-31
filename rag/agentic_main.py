@@ -59,10 +59,15 @@ from rag.agent_tools import (
     CRAWLER_OUTPUT,
 )
 from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous, _keyword_table
-from rag.router import route as _classify_query
+from rag.router import route as _classify_query, _keyword_route, QueryType
 
 FTS_DB = "rag/fts_proto3.db"
 _MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see _after_agent
+
+# Split on 逗號/句號 (full-width and half-width) -- clause boundaries plan_node's
+# compound-query detection and multi_sub_query_node's splitting both reason
+# about. Same pattern as production's rag/nodes/decomposition.py.
+_CLAUSE_SPLIT_RE = re.compile(r'[，。,.]')
 
 # Known office mandates -- deliberately incomplete (only core offices seen in
 # testing so far). Other subdomains show "尚無職掌描述" in domain_router_node's
@@ -388,13 +393,32 @@ def plan_node(state: AgenticState) -> dict:
     state["messages"] (empty here, since the main loop never ran) and reason
     over that -- an empty context is just an input to their existing LLM
     judgment (resource_node) / deterministic scan (contact_node), not a
-    separate code path (2026-08-30 redesign)."""
+    separate code path (2026-08-30 redesign).
+
+    D14 (2026-08-30 addition): checks for a compound query FIRST, before
+    the single-label classifier runs at all -- reusing router.py's own
+    _keyword_route() per clause (split on 逗號/句號), same "keyword first,
+    zero LLM cost" layer production's query_decomposition_node already
+    validated. A query is compound only if 2+ clauses resolve to DIFFERENT
+    QueryTypes; a single-topic query with a mere pause is not (mirrors
+    production's exact reasoning, see rag/nodes/decomposition.py). This
+    only catches CROSS-type compound queries ("休學，圖書館電話多少") --
+    same-TYPE compound queries ("休學和退學的差別") are a structural blind
+    spot here, caught instead by self_eval_node's post-hoc full-query
+    check (D7-D9's two-layer-defense table)."""
+    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(state["query"]) if c.strip()]
+    if len(clauses) >= 2:
+        types_found = {t for t in (_keyword_route(c) for c in clauses) if t is not None}
+        if len(types_found) >= 2:
+            return {"query_type": "compound"}
     result = _classify_query(state["query"], use_llm_fallback=True)
     return {"query_type": result.query_type.value}
 
 
 def _after_plan(state: AgenticState) -> str:
     qt = state.get("query_type")
+    if qt == "compound":
+        return "compound"
     if qt == "contact":
         return "contact"
     if qt == "resource":
@@ -799,6 +823,95 @@ def _after_resource(state: AgenticState) -> str:
     return "rewrite"
 
 
+# ── Compound query handling (§M D14, v1 sequential) ─────────────────────
+
+_loop_graph_cache = None
+
+
+def _build_loop_graph():
+    """Compiles rewrite_node<->agent_node<->tools (plus resource_node/
+    contact_node's D3/D4 marker chain) as an INDEPENDENT StateGraph, separate
+    from build_graph()'s outer compiled graph -- reused by
+    multi_sub_query_node's nested .invoke() calls (D14 Phase 1b) so each
+    sub-query gets its own fully isolated turn/rewritten/subdomain_hint/
+    query_type, with zero risk of the concurrent-write InvalidUpdateError
+    Phase 1 proved happens when multiple executions share ONE graph run
+    (scratchpad/spike_send.py). Reuses the exact same node functions the
+    outer graph uses -- no logic duplicated, just a second, smaller
+    assembly of them. Entry routing reuses _after_plan's own contact/
+    resource/knowledge logic (a sub-query's query_type is already set by
+    multi_sub_query_node before invoking this, so no plan_node/compound-
+    detection step is needed here -- compound-within-compound is out of
+    scope). Compiled once (module-level cache): compiling is cheap, but
+    there's no reason to repeat it every sub-query call."""
+    global _loop_graph_cache
+    if _loop_graph_cache is not None:
+        return _loop_graph_cache
+    g = StateGraph(AgenticState)
+    g.add_node("rewrite_node", rewrite_node)
+    g.add_node("domain_router_node", domain_router_node)
+    g.add_node("agent_node", agent_node)
+    g.add_node("tools", ToolNode(TOOLS))
+    g.add_node("resource_node", resource_node)
+    g.add_node("contact_node", contact_node)
+    g.add_conditional_edges(START, _after_plan,
+                             {"knowledge": "rewrite_node", "resource": "resource_node", "contact": "contact_node"})
+    g.add_edge("rewrite_node", "domain_router_node")
+    g.add_edge("domain_router_node", "agent_node")
+    g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": END})
+    g.add_conditional_edges("tools", _after_tools, {"resource": "resource_node", "contact": "contact_node", "rewrite": "rewrite_node", "end": END})
+    g.add_conditional_edges("resource_node", _after_resource, {"contact": "contact_node", "rewrite": "rewrite_node"})
+    g.add_edge("contact_node", "rewrite_node")
+    _loop_graph_cache = g.compile()
+    return _loop_graph_cache
+
+
+def multi_sub_query_node(state: AgenticState) -> dict:
+    """v1 sequential implementation of #8 (§M D14) -- runs each detected
+    sub-query through its own fully independent invocation of
+    _build_loop_graph(), one after another. Deliberately NOT Send/parallel
+    (2026-08-30 decision): sequential sidesteps the concurrent-write problem
+    entirely (nothing shares a graph run, so there's nothing to conflict),
+    matches production's own v1-then-Send-upgrade precedent
+    (rag/nodes/decomposition.py), and Send's actual wall-clock parallelism
+    benefit here is unverified -- upgrading to Send is an explicit follow-up
+    (§M D14), not abandoned.
+
+    Each sub-query's turn/rewritten/subdomain_hint/query_type live ONLY
+    inside that one nested .invoke() call and are discarded when it returns
+    -- only `messages` (which has add_messages as its reducer) crosses back,
+    via plain list concatenation here since this is one node's single
+    return, not a multi-branch merge.
+
+    Failure isolation: each sub-query's .invoke() is wrapped in its own
+    try/except (§M D14 Phase 4) -- one sub-query failing appends an honest
+    failure note to messages instead of raising, which would otherwise abort
+    the whole compound-query answer per Phase 1 Test 2's confirmed behavior
+    (an uncaught exception propagates to the caller and kills the entire
+    run, not just one branch).
+
+    Known limitation (v1, accepted -- see D14): if self_eval_node retries
+    this compound query, the WHOLE for-loop re-runs (all N sub-queries),
+    not just the one that was actually deficient -- self_eval currently has
+    no way to know which sub-query, if any, was the problem. Not solved
+    this pass."""
+    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(state["query"]) if c.strip()]
+    loop_graph = _build_loop_graph()
+    all_messages: list = []
+    for clause in clauses:
+        qt = _keyword_route(clause) or QueryType.KNOWLEDGE
+        try:
+            result = loop_graph.invoke({
+                "query": clause, "subdomain_hint": None, "query_type": qt.value,
+                "turn": 0, "rewritten": "", "stuck_turns": 0, "messages": [],
+                "answer": None, "self_eval_note": None,
+            })
+            all_messages.extend(result.get("messages", []))
+        except Exception as e:
+            all_messages.append(HumanMessage(content=f"[子問題「{clause}」查詢時發生錯誤，未能取得資訊：{e}]"))
+    return {"messages": all_messages}
+
+
 # ── Graph assembly ───────────────────────────────────────────────────────
 
 def build_graph():
@@ -812,10 +925,13 @@ def build_graph():
     g.add_node("contact_node", contact_node)
     g.add_node("synthesis_node", synthesis_node)
     g.add_node("self_eval_node", self_eval_node)
+    g.add_node("multi_sub_query_node", multi_sub_query_node)
 
     g.add_edge(START, "plan_node")
     g.add_conditional_edges("plan_node", _after_plan,
-                             {"knowledge": "rewrite_node", "resource": "resource_node", "contact": "contact_node"})
+                             {"knowledge": "rewrite_node", "resource": "resource_node",
+                              "contact": "contact_node", "compound": "multi_sub_query_node"})
+    g.add_edge("multi_sub_query_node", "synthesis_node")
     g.add_edge("rewrite_node", "domain_router_node")
     g.add_edge("domain_router_node", "agent_node")
     g.add_conditional_edges("agent_node", _after_agent, {"tools": "tools", "end": "synthesis_node"})
