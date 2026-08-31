@@ -202,8 +202,9 @@ _SYNTHESIS_PROMPT = """你是政大學務問答系統的最終答案撰寫者，
    格式：對每個有資料的辦公室，從其名單裡挑選最相關的1-2位承辦人（同一辦公室內部才需要篩選，不是辦公室之間篩選）：
    `姓名（職責）分機XXXXX——選擇原因：[一句話，例如「負責最終核准」「第一線受理窗口」「這是唯一列出分機的聯絡人」]`
    選擇原因必須具體對應這個人的職責欄位或這題的辦理流程，不能只寫「相關人員」這種空話。如果內容顯示某個步驟需要多層審核（例如先由承辦人受理，再經組長、單位主管逐層簽核），把實際涉及的每一層都列出來、每層各自附上選擇原因，不要只挑一位；如果只是單純的一般承辦窗口，列1-2位最相關的即可。**承辦人姓名是必填項目，不能只寫辦公室名稱、樓層、分機。**
-3. 如果對話歷史顯示已經搜尋多次仍找不到某個細節，誠實說明未查到，不要杜撰。
-4. 回答最後附上來源URL。"""
+3. 如果對話歷史裡有【表單全文】區塊，且裡面包含**兩份以上**表單：這些是`resource_node`偵測到的全部表單，全部抓取、未經相關性篩選（跟D11/contact_node同一個原則：fetch階段不篩，篩選留給你這一步）。**只挑跟原始問題最直接相關的1-2份**引用細節、列出下載連結，其餘不相關情境的表單（例如問題只問休學，卻同時抓到「提早復學申請書」這種不同情境用的表單）不要列出、不要引用其內容——但只有一份表單時，直接使用即可，不需要這條規則。
+4. 如果對話歷史顯示已經搜尋多次仍找不到某個細節，誠實說明未查到，不要杜撰。
+5. 回答最後附上來源URL。"""
 
 _SELF_EVAL_PROMPT = """你是品質複核者，任務是判斷這次的回答有沒有問題——不是重新回答問題，只需要判斷。
 
@@ -797,42 +798,49 @@ def _extract_checklist_blocks(text: str) -> list[dict]:
 def resource_node(state: AgenticState) -> dict:
     """Deterministically routed here by either _after_tools (marker found on
     a ToolMessage) or _after_plan (Plan_node classified the query RESOURCE
-    directly) -- both are the objective gate (§M D3/D6); this node itself no
-    longer re-derives "how did I get here" via marker regex vs empty-
-    messages branching (2026-08-30 redesign -- that branching was doing the
-    same underlying judgment three different ways in code instead of once
-    via a prompt). One code path: read whatever context_text is currently
-    available (the last message's content, or "" if this is the direct
-    Plan_node route), hand it to _judge_forms() along with the query --
-    that single LLM call decides which form(s), if any, are worth fetching,
-    using the full known-forms metadata list rather than a page search (see
-    _list_forms_metadata()/_judge_forms() docstrings). Fetches each judged-
-    relevant form's full content via the existing get_form_tool logic (no
-    duplication), then scans the fetched content for office names (§M D4)
-    so _after_resource can decide whether to chain into contact_node. Hands
-    back a HumanMessage -- same pattern as domain_router_node, since this
-    isn't a response to any AIMessage tool_call and so can't legitimately be
-    a ToolMessage."""
+    directly) -- both are the objective gate (§M D3/D6).
+
+    2026-08-30 redesign (§N.4): fetches ALL forms deterministically detected
+    via extract_form_ids() -- no pre-fetch relevance judge anymore. The
+    prior design (_judge_forms() deciding which detected forms were "worth"
+    fetching before fetching them) was found to have the same structural
+    risk contact_node's docstring already warns against: a bad pre-fetch
+    judgment call permanently loses content with no fallback. §N.3's
+    investigation into a related regression additionally found this LLM
+    judge call itself behaves unpredictably (candidate-pool-size changes
+    that should have made it MORE reliable measured LESS reliable instead,
+    and the true cause was never fully pinned down) -- removing the call
+    from the common path sidesteps that instability entirely rather than
+    chasing it further. This also matches production's own
+    rag/nodes/retrieval_resource.py: it fetches every detected form_id
+    unconditionally and defers ALL relevance filtering to the synthesis
+    prompt ("if there's more than one, pick the 1-2 most relevant") --
+    _SYNTHESIS_PROMPT rule 3 now carries the equivalent instruction.
+    _judge_forms() (metadata-search) is kept ONLY for the direct Plan_node
+    RESOURCE route, where there's no page text to extract form_ids from at
+    all -- a raw query never contains a literal form_id."""
     messages = state.get("messages") or []
     last = messages[-1] if messages else None
     context_text = str(last.content) if last is not None else ""
-    relevant_ids = _judge_forms(state["query"], context_text, state.get("subdomain_hint"))
-    if not relevant_ids:
-        return {}
+    detected_ids = sorted(extract_form_ids(context_text)) if context_text else []
+    if detected_ids:
+        relevant_ids = detected_ids
+    else:
+        relevant_ids = _judge_forms(state["query"], context_text, state.get("subdomain_hint"))
+        if not relevant_ids:
+            return {}
     fetched_ids = set(relevant_ids)
     results = [get_form_tool.invoke({"form_id": fid}) for fid in relevant_ids]
     combined = "\n\n".join(results)
 
     # Cross-reference pass: a fetched form's own text can reference another
-    # form_id never mentioned before -- re-run the SAME judge on the now-
-    # larger context_text (original context + newly fetched form text),
-    # excluding ids already fetched. Bounded to a single extra pass (not
+    # form_id never mentioned before -- fetch those too, same fetch-all
+    # principle (no judge here either). Bounded to a single extra pass (not
     # recursive) to keep this deterministic node's cost bounded; no case
     # observed yet needing a deeper chain.
-    more_ids = [fid for fid in _judge_forms(state["query"], combined, state.get("subdomain_hint"))
-                if fid not in fetched_ids]
-    if more_ids:
-        combined += "\n\n" + "\n\n".join(get_form_tool.invoke({"form_id": fid}) for fid in more_ids)
+    new_ids = [fid for fid in extract_form_ids(combined) if fid not in fetched_ids]
+    if new_ids:
+        combined += "\n\n" + "\n\n".join(get_form_tool.invoke({"form_id": fid}) for fid in new_ids)
 
     # Structural extraction (2026-08-30, §M D14 extraction discussion) --
     # deterministic table parsing, runs BEFORE office detection so its
