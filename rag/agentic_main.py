@@ -689,6 +689,101 @@ def _judge_forms(query: str, context_text: str, subdomain_hint: str | None) -> l
     return [fid for fid in valid_ids if fid in raw]
 
 
+_STATION_ROLE_RE = re.compile(r'[（(](\d+)[）)]\s*([^\s|]{1,20})')
+_ROLE_KEYWORDS = ['組長', '教務長', '主任', '批示', '核准', '簽核', '審核', '核可', '秘書']
+_CHECKBOX_SKIP_LABELS = {'原因'}  # generic student-fill-in fields, not info the answer should relay
+
+
+def _extract_station_roles(text: str) -> dict[str, list[str]]:
+    """Deterministic table-row parser (2026-08-30) -- for each numbered
+    station ("（N）label"), scans OTHER cells in the SAME row for short
+    (<=15 chars after stripping the space-between-every-character artifact
+    this form's table-to-text extraction leaves) cells containing a role
+    keyword (組長/教務長/etc). A row with exactly ONE station marker plus
+    extra role cells means that ONE station has multiple approval layers
+    (e.g. 休學's station 7: 教務處註冊組 needs BOTH 組長 AND 教務長 sign-
+    off, confirmed via direct inspection of QP-T01-03-02's real table); a
+    row with several station markers and no extra cells (stations 1-3,
+    4-6) means those are independent single-role stations. Purely
+    structural (counts/matches table cells), no LLM call -- generalizes to
+    any form with this table shape, not hardcoded to 休學's specific
+    station numbers or office names."""
+    roles: dict[str, list[str]] = {}
+    for line in text.split('\n'):
+        if '|' not in line:
+            continue
+        cells = [c.strip() for c in line.split('|') if c.strip()]
+        stations = [m.group(1) for c in cells for m in _STATION_ROLE_RE.finditer(c)]
+        if len(stations) != 1:
+            continue
+        extras = []
+        for c in cells:
+            c_clean = c.replace(' ', '').replace('　', '')
+            if _STATION_ROLE_RE.search(c):
+                continue
+            if len(c_clean) <= 15 and any(kw in c_clean for kw in _ROLE_KEYWORDS):
+                extras.append(c_clean)
+        if extras:
+            roles[stations[0]] = extras
+    return roles
+
+
+def _offices_from_role_keywords(role_cells: list[str]) -> list[str]:
+    """Deterministic reverse lookup (2026-08-30) closing a real gap
+    _detect_offices()'s LLM judge left uncaught: a role cell like "教務長
+    批示" contains the role keyword "教務長" -- rather than matching the
+    WHOLE noisy cell text against the catalog (what _detect_offices()
+    already does, confirmed unreliable for this exact case by direct
+    testing: appending an explicit "站點7：教務長批示" line to
+    _detect_offices()'s scanned text did NOT change its output, "教務長室"
+    stayed undetected even when called out explicitly -- the LLM judge
+    appears to collapse it into the more prominent nearby "教務處" match
+    rather than surfacing it as its own distinct catalog entry), substring-
+    match the ALREADY-ISOLATED short keyword against catalog names instead.
+    "教務長" is a literal substring of catalog entry "教務長室" -- confirmed
+    to match uniquely, and OfficeLookupSkill.run(["教務長室"]) returns a
+    clean 11-person roster headed by 劉吉軒(教務長), more precise than the
+    "教務處" catalog entry's 24-person combined roster. "組長" deliberately
+    matches no catalog entry (too generic a title to be an office name by
+    itself) -- confirmed this doesn't misfire into false positives."""
+    catalog_names = [name for name, _sub in _keyword_table()]
+    found: list[str] = []
+    for cell in role_cells:
+        for kw in _ROLE_KEYWORDS:
+            if kw not in cell:
+                continue
+            for name in catalog_names:
+                if kw in name and name not in found:
+                    found.append(name)
+    return found
+
+
+def _extract_checklist_blocks(text: str) -> list[dict]:
+    """Deterministic □-option block parser (2026-08-30) -- finds table rows
+    with 2+ checkbox markers and a plausible descriptive label (the other
+    non-□ cell in the same row), for content like pickup-method options
+    that don't map to any office/contact but are still parts of the form a
+    complete answer should mention (confirmed real gap: QP-T01-03-02's
+    領取方式 section, 三個工作天/郵寄/iNCCU options, was never once
+    mentioned in early synthesis_node output despite being fetched).
+    Filters out obvious student-fill-in fields via _CHECKBOX_SKIP_LABELS
+    (a short generic label like "原因") or a missing label entirely (e.g.
+    the 學士班/碩士班/博士班 degree-level checkboxes have no descriptive
+    label in the same row) -- NOT a complete filter, may need iteration
+    against more forms; flagged honestly rather than assumed correct."""
+    blocks = []
+    for line in text.split('\n'):
+        if line.count('□') < 2:
+            continue
+        cells = [c.strip() for c in line.split('|') if c.strip()]
+        label = next((c for c in cells if '□' not in c and len(c) < 20), None)
+        options = next((c for c in cells if '□' in c), '')
+        if label is None or label in _CHECKBOX_SKIP_LABELS:
+            continue
+        blocks.append({"label": label, "options": options})
+    return blocks
+
+
 def resource_node(state: AgenticState) -> dict:
     """Deterministically routed here by either _after_tools (marker found on
     a ToolMessage) or _after_plan (Plan_node classified the query RESOURCE
@@ -729,8 +824,29 @@ def resource_node(state: AgenticState) -> dict:
     if more_ids:
         combined += "\n\n" + "\n\n".join(get_form_tool.invoke({"form_id": fid}) for fid in more_ids)
 
-    combined = "[表單全文，系統偵測到表單編號後自動抓取，請直接引用其中的流程/站點/費用等細節]\n\n" + combined
+    # Structural extraction (2026-08-30, §M D14 extraction discussion) --
+    # deterministic table parsing, runs BEFORE office detection so its
+    # findings can feed the offices list (not after resource->contact has
+    # already run and it's too late to fetch what extraction discovers --
+    # see design doc's worked example of why this ordering matters).
+    station_roles = _extract_station_roles(combined)
+    checklist_blocks = _extract_checklist_blocks(combined)
+
     offices = _detect_offices(combined)
+    role_offices = _offices_from_role_keywords(
+        [cell for cells in station_roles.values() for cell in cells])
+    for o in role_offices:
+        if o not in offices:
+            offices.append(o)
+
+    combined = "[表單全文，系統偵測到表單編號後自動抓取，請直接引用其中的流程/站點/費用等細節]\n\n" + combined
+    if station_roles:
+        lines = [f"- 站點{n}：{'、'.join(roles)}（多層審核，每一層都要在答案中列出對應聯絡人，不要只挑一層）"
+                 for n, roles in station_roles.items()]
+        combined += "\n\n[表單站點審核層級偵測]\n" + "\n".join(lines)
+    if checklist_blocks:
+        lines = [f"- {b['label']}：{b['options']}" for b in checklist_blocks]
+        combined += "\n\n[表單其他決策/資訊項目，答案應涵蓋]\n" + "\n".join(lines)
     if offices:
         combined += f"\n\n[偵測到辦公室: {', '.join(offices)}]"
     return {"messages": [HumanMessage(content=combined)]}
