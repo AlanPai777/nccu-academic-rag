@@ -624,16 +624,36 @@ def _detect_offices(text: str) -> list[str]:
     same reasoning as _judge_forms(). Catalog is NOT subdomain-scoped: a
     single form/page can reference offices across multiple subdomains (an
     aca form's station list can include an osa office), so narrowing to one
-    subdomain here would silently drop cross-subdomain office mentions."""
+    subdomain here would silently drop cross-subdomain office mentions.
+
+    2026-08-31 addition (§N.6, D16's Layer 1 minimal subset): a deterministic
+    substring pre-check runs BEFORE the LLM judge and its hits are UNIONED
+    into the result, not used to skip the LLM call. Added after finding
+    _detect_offices() fails ~93% of the time (14/15 sampled calls) on a
+    SHORT bare query (contact_node's direct Plan_node-CONTACT-route entry
+    passes just the raw user query, e.g. "出納組電話幾號") even though the
+    office name is an EXACT literal substring of that query and of exactly
+    one catalog entry ("出納組") -- confirmed via direct testing that the
+    same LLM judge reliably finds "出納組" when given a full page of text
+    instead, so this is a short-input-specific failure mode of the LLM
+    step, not a general catalog-matching failure. Layer 1 sidesteps it for
+    free (pure string containment, ~433 checks, negligible cost) without
+    touching the LLM judge at all -- it does NOT replace it, since Layer 1
+    still can't resolve colloquial/short-vs-full-name mismatches ("住宿組"
+    -> "住宿輔導組"), which remains the LLM judge's job below."""
     catalog = _keyword_table()
     if not catalog:
         return []
+    valid_names = {name for name, _sub in catalog}
+    layer1_hits = [name for name in valid_names if name in text]
+
     catalog_str = "\n".join(f"- {name}（{sub}）" for name, sub in catalog)
     prompt = _OFFICE_JUDGE_PROMPT.format(text=text, catalog=catalog_str)
     raw = simple_chat(messages=[{"role": "user", "content": prompt}], max_tokens=300).strip()
-    valid_names = {name for name, _sub in catalog}
     candidates = [n.strip() for n in re.split(r"[,，]", raw)]
-    return [n for n in dict.fromkeys(candidates) if n in valid_names]
+    llm_hits = [n for n in candidates if n in valid_names]
+
+    return list(dict.fromkeys(layer1_hits + llm_hits))
 
 
 def _list_forms_metadata(subdomain_hint: str | None) -> list[dict]:
