@@ -661,49 +661,33 @@ def _list_forms_metadata(subdomain_hint: str | None) -> list[dict]:
 
 
 def _judge_forms(query: str, context_text: str, subdomain_hint: str | None) -> list[str]:
-    """Two-tier candidate sourcing (2026-08-30 fix, §N.1): a real regression
-    was found where this function ALWAYS asked the judge to search the full
-    subdomain metadata list (~32 forms for osa) even when context_text
-    already contained a deterministically-extracted form_id marker
-    (extract_form_ids() -- pure regex, zero LLM cost) -- discarding a much
-    narrower, already-known candidate set in favor of a harder open-ended
-    search. This was a real capability lost during the 2026-08-30 D11
-    unification (the pre-D11 version took an explicit form_ids parameter
-    from the marker and only judged among those).
+    """Single unified judgment step, used identically no matter how
+    resource_node was entered -- always judges against the FULL known-forms
+    metadata list (_list_forms_metadata() -- a bounded lookup, never a
+    search), not a candidate set narrowed by extract_form_ids().
 
-    Tier 1 (marker-mode, the common case): if extract_form_ids(context_text)
-    finds anything, restrict the candidate pool to JUST those ids' metadata
-    -- the judge's task shrinks from "search ~32 candidates" to "filter a
-    handful already known to be mentioned," matching the same
-    cheap-candidates-then-judge shape validated elsewhere (search_texts,
-    D16's proposed office-detection cascade). A single detected id skips
-    the LLM call entirely (nothing to choose between).
-
-    Tier 2 (direct Plan_node RESOURCE route, no page fetched yet): context_
-    text has nothing to extract ids from, so falls back to the full known-
-    forms list -- a RESOURCE query like "休學申請表在哪裡下載" never
-    contains a form_id as a literal substring, so there's no deterministic
-    anchor available here; this is the only case that still needs the
-    broader (im)possible-nothing-to-lose search.
-
-    Honest caveat (§N.1): this fix alone does NOT resolve the 退宿規定
-    regression that motivated it -- testing showed the judge still
-    misfired on that case even with the candidate pool narrowed to 2,
-    because the actual cause there was context_text carrying get_page_
-    tool's own header/marker text alongside the real page content, not
-    candidate-pool size. That's a separate fix (§N.1 direction 2)."""
-    detected_ids = sorted(extract_form_ids(context_text)) if context_text else []
-    if detected_ids:
-        if len(detected_ids) == 1:
-            return detected_ids
-        forms = [f for f in _list_forms_metadata(subdomain_hint) if f["form_id"] in detected_ids]
-        if not forms:
-            return detected_ids  # metadata lookup missed them -- still trust the deterministic detection
-    else:
-        scope = subdomain_hint or _layer1_match(query)
-        forms = _list_forms_metadata(scope)
-        if not forms:
-            return []
+    2026-08-30 REVERT NOTICE (§N.1): a "Tier 1: narrow to
+    extract_form_ids()-detected candidates" optimization was tried here and
+    reverted the same day -- rigorous re-testing (8 runs per condition,
+    same query/context/timestamp) showed the FULL 32-candidate version
+    scored 8/8 correct while the narrowed-to-2-candidates version scored
+    0/8, the opposite of what the optimization assumed ("fewer candidates =
+    simpler task = more reliable"). Root cause of the *original* regression
+    this was meant to fix is still unresolved and was NOT candidate-pool
+    size or context_text formatting (both were tested in isolation and
+    ruled out) -- earlier "deterministic, reproducible" format-sensitivity
+    findings in this investigation were themselves based on too few trials
+    (3-5 runs) and did not replicate under larger samples; the true
+    behavior of this judge call across repeated identical inputs is not
+    yet well understood and needs more careful, larger-sample
+    investigation before any further optimization attempt. Do not re-add
+    candidate-pool narrowing here without re-verifying against a large
+    sample first -- this exact "obvious" optimization already measured
+    worse once."""
+    scope = subdomain_hint or _layer1_match(query)
+    forms = _list_forms_metadata(scope)
+    if not forms:
+        return []
     forms_str = "\n".join(f"- {f['form_id']}：{f['title']}（{f['unit']}）{f['description']}" for f in forms)
     prompt = _FORM_JUDGE_PROMPT.format(
         query=query,
