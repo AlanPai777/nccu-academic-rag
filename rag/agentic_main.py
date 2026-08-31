@@ -661,23 +661,49 @@ def _list_forms_metadata(subdomain_hint: str | None) -> list[dict]:
 
 
 def _judge_forms(query: str, context_text: str, subdomain_hint: str | None) -> list[str]:
-    """Single unified judgment step, used identically no matter how
-    resource_node was entered (2026-08-30 redesign, replacing what used to
-    be two separate code paths -- a regex marker-scan branch and a full
-    anchor-page-search branch -- with one LLM call that always sees the same
-    two inputs: whatever context_text is currently available (may be "" --
-    the judge handles that naturally in its own prompt, no branching needed
-    in the caller) and the full known-forms metadata list
-    (_list_forms_metadata() -- a bounded lookup, never a search). A raw
-    RESOURCE query like "休學申請表在哪裡下載" never contains a form_id as
-    a literal substring the way a CONTACT query contains an office name, so
-    unlike _detect_offices() this can't be a plain substring scan -- but it
-    also doesn't need search, because the candidate list (every form's
-    title/description/unit) is already sitting in supplementary_map.json."""
-    scope = subdomain_hint or _layer1_match(query)
-    forms = _list_forms_metadata(scope)
-    if not forms:
-        return []
+    """Two-tier candidate sourcing (2026-08-30 fix, §N.1): a real regression
+    was found where this function ALWAYS asked the judge to search the full
+    subdomain metadata list (~32 forms for osa) even when context_text
+    already contained a deterministically-extracted form_id marker
+    (extract_form_ids() -- pure regex, zero LLM cost) -- discarding a much
+    narrower, already-known candidate set in favor of a harder open-ended
+    search. This was a real capability lost during the 2026-08-30 D11
+    unification (the pre-D11 version took an explicit form_ids parameter
+    from the marker and only judged among those).
+
+    Tier 1 (marker-mode, the common case): if extract_form_ids(context_text)
+    finds anything, restrict the candidate pool to JUST those ids' metadata
+    -- the judge's task shrinks from "search ~32 candidates" to "filter a
+    handful already known to be mentioned," matching the same
+    cheap-candidates-then-judge shape validated elsewhere (search_texts,
+    D16's proposed office-detection cascade). A single detected id skips
+    the LLM call entirely (nothing to choose between).
+
+    Tier 2 (direct Plan_node RESOURCE route, no page fetched yet): context_
+    text has nothing to extract ids from, so falls back to the full known-
+    forms list -- a RESOURCE query like "休學申請表在哪裡下載" never
+    contains a form_id as a literal substring, so there's no deterministic
+    anchor available here; this is the only case that still needs the
+    broader (im)possible-nothing-to-lose search.
+
+    Honest caveat (§N.1): this fix alone does NOT resolve the 退宿規定
+    regression that motivated it -- testing showed the judge still
+    misfired on that case even with the candidate pool narrowed to 2,
+    because the actual cause there was context_text carrying get_page_
+    tool's own header/marker text alongside the real page content, not
+    candidate-pool size. That's a separate fix (§N.1 direction 2)."""
+    detected_ids = sorted(extract_form_ids(context_text)) if context_text else []
+    if detected_ids:
+        if len(detected_ids) == 1:
+            return detected_ids
+        forms = [f for f in _list_forms_metadata(subdomain_hint) if f["form_id"] in detected_ids]
+        if not forms:
+            return detected_ids  # metadata lookup missed them -- still trust the deterministic detection
+    else:
+        scope = subdomain_hint or _layer1_match(query)
+        forms = _list_forms_metadata(scope)
+        if not forms:
+            return []
     forms_str = "\n".join(f"- {f['form_id']}：{f['title']}（{f['unit']}）{f['description']}" for f in forms)
     prompt = _FORM_JUDGE_PROMPT.format(
         query=query,
