@@ -274,9 +274,25 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 **過程中的插曲**：驗證途中一度發現`python`指令完全找不到（`which python`/`type python`皆失敗），排查後確認是使用者本地venv環境意外關閉，不是這次改動造成的問題——venv重新啟用後（`/mnt/d/NCCU_DATA/NCCU-AI-SYSTEM/venv`，在repo外層一層，說明先前用`find`在repo內搜尋找不到venv目錄的原因），全部驗證正常通過。
 
-### Step 2：`routing.py`拿掉PROCEDURE/KNOWLEDGE分流
-**改動**：`_after_router`（或整併後的`_after_plan`）只回傳`contact`/`resource`/`compound`/`knowledge`（PROCEDURE不再是獨立分支）。
-**驗證**：對6-7個既有regression案例（休學/復學/在職生復學/退宿規定/選課上限/出納組電話/表單下載），確認分類結果符合預期（原PROCEDURE案例現在應該落在`knowledge`分支）。
+### Step 2：✅ 已完成（2026-09-01）——`plan_node`實作，取代`routing.py`+`decomposition.py`
+
+**改動**：新增`rag/agentic/nodes/plan.py`——直接從`agentic_main.py`的`plan_node`/`_after_plan`原樣搬過來（不是重新實作，是既已驗證過的參考實作），`_after_plan`只回傳`compound`/`contact`/`resource`/`knowledge`（PROCEDURE不再是獨立分支，併入`knowledge`）。比照Step 1的模式，**不修改**production現有的`rag/nodes/routing.py`/`rag/nodes/decomposition.py`（留到Step 9才真正刪除），這步純新增檔案。
+
+**驗證結果**：7個既有regression案例直接呼叫`plan_node`+`_after_plan`（node-level單元測試，尚未組完整graph）：
+
+| Query | query_type | 分流branch |
+|---|---|---|
+| 如何辦理休學 | procedure | **knowledge**（原PROCEDURE，符合預期併入） |
+| 如何辦理復學 | procedure | **knowledge** |
+| 在職生怎麼辦理復學 | procedure | **knowledge** |
+| 退宿規定 | knowledge | knowledge |
+| 選課上限幾學分 | knowledge | knowledge |
+| 出納組電話幾號 | contact | **contact**（直接分流保留） |
+| 休學申請表在哪裡下載 | resource | **resource**（直接分流保留） |
+
+7/7全部符合預期。額外驗證複合query偵測邏輯也正確搬過來：「如何辦理休學，圖書館的電話是多少」→`query_type=compound`，`branch=compound`。
+
+`git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`完全未被觸碰，這步純新增`rag/agentic/nodes/plan.py`一個檔案。
 
 ### Step 3：接入agentic版的`rewrite_node`/`domain_router_node`/`agent_node`/`tools`，取代`retrieval_node`＋`retrieval_anchor_node`/`retrieval_expand_node`
 **改動**：這是最大的一步——整個KNOWLEDGE/原PROCEDURE路徑換成真正的多node迴圈。`retrieval_procedure.py`／`retrieval_knowledge.py`的既有邏輯**先不刪檔案**（保留當備份對照，等Step 3驗證通過、確認新路徑穩定後才在後續步驟移除）。
