@@ -442,10 +442,22 @@ Data層的缺口（URL存在但傳不到`synthesis_node`）已修好且驗證穩
 
 **誠實記錄，沿用reference implementation自己的坦承**：Stage 2本質上仍是「訊息提示→LLM決定要不要行動」，跟這個專案已經證實不穩定的`_AGENT_SYSTEM`時機子句同一種機制形狀；Stage 1的存在是為了在Stage 2的較軟判斷介入前，先攔住便宜、明確的失敗案例，不是聲稱Stage 2本身變得更可靠了。這次驗證也沒有真的觀察到一個「self_eval retry成功救回」的真實失敗案例（兩次端到端測試都是Stage 1/Stage 2一次就通過）——retry機制本身是正確接上、可測試的，但實際觸發頻率/救援效果，這次驗證沒有機會展示，留待之後真實案例出現時再觀察。
 
-### Step 8：Parametric fallback（E7）——不遷移（Part 6.4已定案）
-**改動**：`_parametric_fallback()`/`_PARAMETRIC_SYSTEM`不遷移，agentic版維持現況（純prompt層級誠實指示，無deterministic退回訓練知識機制）。
-**驗證**：故意構造「完全查無資料」的query，確認遷移後系統誠實回應「查無資料」，不會退回LLM自己的訓練知識回答（不管有沒有標註來源）。
-**明確不在這步範圍內**：§6.4記錄的「deterministic強制覆蓋、給固定誠實回應」替代機制——這是獨立的後續設計項目，這一步只確認E7本身沒有被遷移過去，不代表要在這步順便把替代機制也做掉。
+### Step 8：✅ 已完成（2026-09-01）——Parametric fallback（E7）確認不遷移
+
+**改動**：無新增檔案——`_parametric_fallback()`/`_PARAMETRIC_SYSTEM`確認沒有被搬進`rag/agentic/`，維持純prompt層級誠實指示（`_SYNTHESIS_PROMPT`規則5：「已經搜尋多次仍找不到，誠實說明未查到，不要杜撰」），沒有deterministic退回訓練知識的機制。這步純粹是驗證，不是實作。
+
+**驗證**（2個獨立、刻意構造的「查無資料」案例，走不同進入路徑）：
+
+| Query | 進入路徑 | 結果 |
+|---|---|---|
+| 火星移民申請表在哪裡下載 | RESOURCE直接分流→`resource_node`no-op→掉回一般搜尋迴圈 | 4輪，最終誠實回答「並未查到關於『火星移民申請表』的任何資訊」，明確標註「來源：未查得相關頁面URL」，沒有杜撰表單、沒有假造連結 |
+| 銀河護衛隊辦公室電話幾號 | CONTACT直接分流→`contact_node`no-op→掉回一般搜尋迴圈 | 5輪，最終誠實回答「皆未發現校內有以此命名的辦公室」，沒有回答任何跟「銀河護衛隊」流行文化相關的訓練知識，沒有杜撰分機號碼 |
+
+兩個案例都確認：**沒有退回LLM訓練知識回答（不管是政大校內業務、還是查詢字面本身的一般知識，例如「銀河護衛隊」是什麼），沒有杜撰來源URL**，符合§6.4的決定跟預期。
+
+**意外的額外發現**：兩個案例的`self_eval_node`都**真的觸發了retry**（分別3輪、4輪重試，`self_eval_note`非空、迴圈確實回到`rewrite_node`重跑）——這補上了Step 7驗證時「兩次端到端測試都一次通過、沒機會觀察retry實際運作」的空缺，確認retry機制不只是正確接上、可測試，在真實案例（這裡是「多次搜尋都找不到」的情境）裡也確實會被觸發並執行。
+
+**明確不在這步範圍內，維持原訂範圍**：§6.4記錄的「deterministic強制覆蓋、給固定誠實回應」替代機制——沒有在這步實作，仍是獨立的後續設計項目。這次驗證顯示現有prompt層級的誠實指示在這2個案例裡表現良好，但n=2仍然不足以宣稱這個機制在所有情況下都可靠，維持原本「先記錄方向，不在這輪範圍內」的判斷。
 
 ### Step 9：`rag/proto3_langgraph.py`刪除，新entry point`rag/agentic_rag.py`（§0.3已定案）
 **改動**：`rag/proto3_langgraph.py`整個刪除；新增`rag/agentic_rag.py`（`build_graph()`/`run()`/CLI，只做graph組裝，import自`rag.agentic.*`），取代舊entry point，CLI呼叫方式改成`python -m rag.agentic_rag`。`rag/nodes/`裡Step 1-8確認要retire的檔案（`retrieval_procedure.py`/`retrieval_knowledge.py`/`extraction.py`／舊版`office_lookup.py`/`retrieval_resource.py`）在這步一併實際刪除（前面幾步保留備份對照用，這步才是真正清除）。
