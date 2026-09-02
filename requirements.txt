@@ -32,6 +32,11 @@ python-dotenv>=1.0
 # Agentic RAG (Prototype 3 — LangGraph)
 langgraph
 
+# Assistant API server (Phase I — server.py, exposes agentic_rag.py over SSE
+# to CourseLangChain-frontend's AssistantChat.vue)
+fastapi
+uvicorn
+
 # Note: PyTorch is NOT listed here — install separately based on your hardware:
 #
 # CPU only:

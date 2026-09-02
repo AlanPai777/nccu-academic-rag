@@ -165,6 +165,40 @@ not a gap in this design.
 - `requirements.txt` had only `langgraph` — `fastapi`/`uvicorn` were added
   for this phase.
 
+## Implementation finding: `synthesis_node` needed a second change to actually stream
+
+Decision B's `stream_mode="messages"` + `langgraph_node` filter was implemented in
+`server.py` exactly as designed, and manual SSE testing confirmed the status
+side-channel worked correctly -- but the final answer still arrived as **one
+whole `data` event**, not token-by-token, on the first end-to-end test.
+
+Root cause: `synthesis_node` called `rag/llm_client.py`'s `simple_chat()`,
+which drives the raw `ollama.Client`/`openai.OpenAI` SDKs directly, never
+touching LangChain's `BaseChatModel` interface. LangGraph's
+`stream_mode="messages"` token streaming works by intercepting a LangChain
+chat model's own streaming callback -- a node whose LLM call never goes
+through that interface still shows up in the `"messages"` stream (tagged
+with the right `langgraph_node`), but as a single complete message, not
+incremental chunks, because there were never any chunks to intercept.
+
+Fix: `synthesis_node` now calls `rag/agentic/nodes/loop.py`'s `_llm` (a
+`ChatOllama` instance, already proven in production via `agent_node`) instead
+of `simple_chat()`, with `.bind(options={"num_predict": 8192})` to preserve
+`simple_chat()`'s original truncation-avoidance margin (long synthesis
+answers run 1000-2000+ tokens; Ollama's cloud API rejects `num_predict=-1`,
+so an explicit positive cap is required, same reasoning `llm_client.py`'s own
+comment gives). Verified via curl against a running `server.py`: the answer
+arrived as 147 separate small `data` events instead of one.
+
+**Scope note**: only `synthesis_node` was switched. `self_eval_node` and
+`rewrite_node`'s `_rewrite_query()` still use `simple_chat()` — their LLM
+output is only ever consumed as a single status-line string (never streamed
+character-by-character to the user), so there was no reason to touch them.
+`agent_node` already only supports Ollama cloud regardless of `LLM_PROVIDER`
+(see `loop.py`'s `_llm` construction) — reusing that same instance in
+`synthesis_node` follows an existing pattern in this codebase, not a new
+inconsistency introduced by this phase.
+
 ## Known gotcha carried over from earlier discussion (applies beyond this phase)
 
 Any caller that reconstructs the full `initial` state dict on every turn (as

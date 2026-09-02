@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from rag.llm_client import simple_chat
+from rag.agentic.nodes.loop import _llm
 from rag.agentic.state import AgentState
 
 _SYNTHESIS_PROMPT = """你是政大學務問答系統的最終答案撰寫者，讀取以下對話歷史（已找到的頁面內容、表單全文、辦公室聯絡資訊），撰寫一則完整、有根據的答案。
@@ -66,7 +66,18 @@ def synthesis_node(state: AgentState) -> dict:
     tool-selection instructions."""
     history = _render_full_messages(state["messages"])
     prompt = _SYNTHESIS_PROMPT.format(query=state["query"], history=history)
-    answer = simple_chat(messages=[{"role": "user", "content": prompt}])
+    # Uses loop.py's already-proven ChatOllama instance (not llm_client.py's
+    # simple_chat(), which calls the raw ollama/openai SDKs directly and is
+    # therefore invisible to LangGraph's stream_mode="messages" token
+    # streaming) so server.py's SSE endpoint can stream this node's answer
+    # token-by-token, filtered by langgraph_node=="synthesis_node". agent_node
+    # already only supports Ollama cloud regardless of LLM_PROVIDER (see
+    # loop.py) -- reusing the same _llm here doesn't introduce a new
+    # inconsistency, it follows the one already established.
+    # .bind() adds an explicit num_predict, same rationale as llm_client.py's
+    # own comment: synthesis answers run long (1000-2000+ tokens), and the
+    # Ollama cloud API needs a positive num_predict, not -1/unlimited.
+    answer = _llm.bind(options={"num_predict": 8192}).invoke([HumanMessage(content=prompt)]).content
     # Also append to messages (not just state["answer"]) so the conclusion
     # survives into the next turn via the add_messages reducer -- state["answer"]
     # itself gets reset to None by every new turn's initial_state() and no node
