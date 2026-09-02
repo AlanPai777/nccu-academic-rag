@@ -300,9 +300,33 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 `git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`完全未被觸碰，這步純新增`rag/agentic/nodes/plan.py`一個檔案。
 
-### Step 3：接入agentic版的`rewrite_node`/`domain_router_node`/`agent_node`/`tools`，取代`retrieval_node`＋`retrieval_anchor_node`/`retrieval_expand_node`
-**改動**：這是最大的一步——整個KNOWLEDGE/原PROCEDURE路徑換成真正的多node迴圈。`retrieval_procedure.py`／`retrieval_knowledge.py`的既有邏輯**先不刪檔案**（保留當備份對照，等Step 3驗證通過、確認新路徑穩定後才在後續步驟移除）。
-**驗證**：休學（原PROCEDURE）＋選課上限/退宿規定（原KNOWLEDGE）三題，`rag/eval.py`分數不能明顯低於production既有基準；用`.stream()`確認每一輪對外可見（這是這一步存在的核心目的，順便驗證）。
+### Step 3：✅ 已完成（2026-09-01）——接入agentic版的`rewrite_node`/`domain_router_node`/`agent_node`/`tools`，取代`retrieval_node`＋`retrieval_anchor_node`/`retrieval_expand_node`
+
+**改動**：新增以下檔案，全部直接從`agentic_main.py`逐行核對搬過來（這次逐一對照原始碼行號後才動筆，避免重演Step 1的schema錯誤）：
+- `rag/agentic/logic/office_detection.py`：`_detect_offices()`（D12語意判斷＋N.7 Layer 1）——雖然規劃上屬於Step 4，但`get_page_tool`直接依賴它，提前搬移，Step 4的`contact_node`/`resource_node`會重用同一份，不會重複
+- `rag/agentic/logic/rewrite.py`：`_rewrite_query`/`_judge_candidates`/`_render_messages`
+- `rag/agentic/tools/`（4個檔案）：`search.py`（`search_texts`）、`grep.py`（`grep_texts_tool`+`_fetched_urls`）、`page.py`（`get_page_tool`+`extract_links_tool`）、`form.py`（`get_form_tool`），`__init__.py`彙總成`TOOLS`清單
+- `rag/agentic/nodes/loop.py`：`rewrite_node`/`domain_router_node`/`agent_node`/`_after_agent`，含`_AGENT_SYSTEM`prompt、`_SUBDOMAIN_DESC`、`ChatOllama.bind_tools()`初始化
+
+比照Step 1/2的模式，`rag/nodes/retrieval_procedure.py`／`rag/nodes/retrieval_knowledge.py`**不修改不刪除**（留到Step 9才移除），這步純新增檔案。
+
+**驗證方式的調整（誠實記錄）**：Step 3原訂驗證計畫是「用`rag/eval.py`對3題評分、分數不能明顯低於基準」——但這實際上做不到，因為`resource_node`/`contact_node`（Step 4）跟`synthesis_node`（Step 5）都還沒接上，沒有真正的答案文字可以拿去給`eval.py`打分（agent決定「夠了」之後，回應內容本來就會被丟棄，交給還沒實作的synthesis_node）。改成用一個暫時的驗證用graph（`rewrite_node→domain_router_node→agent_node→tools`迴圈，`agent_node`判斷「end」時直接接END，不含synthesis），檢查loop本身的機制對不對，完整`rag/eval.py`數字比較留到Step 5 synthesis_node接上之後才有意義。
+
+**驗證結果**（3題，全部跟`agentic_main.py`原始行為逐項比對）：
+
+| Query | 結果 | 跟`agentic_main.py`參考行為比對 |
+|---|---|---|
+| 如何辦理休學 | 3輪：`search_texts`（judge通過）→`get_page_tool`（偵測到3個表單編號）→agent判斷「夠了」 | 完全一致，輪數/工具序列/表單偵測結果都相符 |
+| 選課上限幾學分 | 5輪：`search_texts`失敗→3次`grep_texts_tool`換詞→`get_page_tool`抓2頁→agent判斷「夠了」 | 完全一致，連N.2記載的「外文中心」辦公室偵測雜訊都在同一頁重現（已知、未修的理論風險，不是這次遷移的新問題） |
+| 退宿規定 | 4輪：`search_texts`失敗→`grep_texts_tool`→`get_page_tool`（偵測到2個表單編號）→agent判斷「夠了」 | 完全一致，兩個表單編號（`QP-M03-01-04`/`QP-M03-01-05`）都正確偵測到 |
+
+`.stream()`對3題都正確顯示每一輪的node執行（`rewrite_node`/`domain_router_node`/`agent_node`/`tools`各自可見）——這是這一步存在的核心目的，達成。
+
+**過程中的插曲**：驗證途中`from langchain_ollama import ChatOllama`失敗（`ModuleNotFoundError`），連`agentic_main.py`本身（完全沒改動的既有檔案）也一樣失敗——確認是環境問題不是這次改動造成的（推測是稍早venv重新啟用時沒有帶回這個套件），`pip install langchain-ollama`後解決，且`agentic_main.py`本身恢復正常，確認不是這次程式碼改動的鍋。
+
+### Step 4：`resource_node`／`contact_node`換成agentic版
+**改動**：`office_lookup.py`的`_PROCEDURE_OFFICES`硬編碼fallback整個拿掉，換成`_detect_offices()`；`retrieval_resource.py`換成fetch-all版本，`_RESOURCE_SYNTHESIS_PROMPT`的「防編造連結」精神併入`synthesis.py`的共用prompt（不是resource自己保留一份獨立synthesis）。
+**驗證**：出納組電話幾號（1輪，Layer1修好的案例）／休學表單下載／休學表單裡7+個蓋章站點的聯絡人完整度（比對D12/N.7已經在`agentic_main.py`驗證過的結果，遷移後應該要重現同樣的完整度，不能退步）。
 
 ### Step 4：`resource_node`／`contact_node`換成agentic版
 **改動**：`office_lookup.py`的`_PROCEDURE_OFFICES`硬編碼fallback整個拿掉，換成`_detect_offices()`；`retrieval_resource.py`換成fetch-all版本，`_RESOURCE_SYNTHESIS_PROMPT`的「防編造連結」精神併入`synthesis.py`的共用prompt（不是resource自己保留一份獨立synthesis）。
