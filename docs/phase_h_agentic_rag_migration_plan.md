@@ -380,9 +380,42 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 `.stream()`顯示`plan_node`（判斷為`compound`）→`multi_sub_query_node`（一次性回傳兩個子句的合併`messages`）→`synthesis_node`——符合設計預期的3-node流程。
 
-**觀察到、但確認是既有限制而非新迴歸的細節**：來源URL只列出休學那頁，圖書館聯絡資訊沒有附URL——這是`contact_node`路徑本身的既有限制（CONTACT查詢跳過retrieval，天生沒有頁面URL可附），CLAUDE.md已經記載這是整個專案層級的已知限制（「CONTACT source attribution」），不是這次遷移或Step 6引入的新問題。
+**觀察到、當時判斷是既有限制而非新迴歸的細節**：來源URL只列出休學那頁，圖書館聯絡資訊沒有附URL——這是`contact_node`路徑本身的既有限制（CONTACT查詢跳過retrieval，天生沒有頁面URL可附），CLAUDE.md已經記載這是整個專案層級的已知限制（「CONTACT source attribution」），不是這次遷移或Step 6引入的新問題。**⚠ 這個限制後來被實際修正，見下方附帶修正**。
 
 `git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`完全未被觸碰，這步純新增`compound.py`一個檔案。
+
+---
+
+## 附帶修正（2026-09-01，不在Step 1-10編號序列內）：CONTACT路徑缺來源URL——`rag/skills/office_lookup_skill.py`
+
+**性質說明**：這是Step 6驗證時發現、進一步追查後動手修正的問題，修的是`rag/skills/office_lookup_skill.py`——一個**共用檔案**，不屬於這次migration正在搬遷/重寫的檔案清單（production的`rag/nodes/office_lookup.py`跟migration的`rag/agentic/nodes/contact.py`都直接import它，沒有各自複製一份），所以不編號進Step 1-10序列，但因為是在migration過程中發現並修正的，記錄在這裡。
+
+### 根因
+
+`office_contacts_index.jsonl`每筆記錄本身就有`url`欄位（Playwright重爬時就有紀錄），但中間兩層都把這個資訊弄丟：
+
+1. **`dynamic_contacts_for_office()`**（`_detect_offices()`解析出catalog全名後，實際查聯絡人的主要路徑）——只把解析出的姓名/分機/email清單回傳，`rec["url"]`從未被帶出來，資料在函式內部就被丟棄
+2. **`_lookup_one()`**——`page_url`欄位存在，但只透過`_find_pages()`（另一條完全不同機制，查`OFFICE_SOURCES`，只認9個舊短名）填寫；對catalog全名（如「教務長室」）這個機制查不到，`page_url`停在`None`，還會提早`return`，即使`contacts`早就查到了
+3. **`format_context()`**——即使`page_url`有值，這個函式原本**根本沒有把它印出來**，`synthesis_node`看到的文字裡從來沒有這個資訊
+
+### 修法
+
+三處都動：`dynamic_contacts_for_office()`改成回傳`(contacts, urls)`tuple，把每筆記錄的`url`一併收集回傳；`_lookup_one()`用這批`urls`當`page_url`的預設值（`_find_pages()`查到的結果仍優先覆蓋，因為那是`OFFICE_SOURCES`人工核實過的來源，這個新機制只是補上它沒涵蓋到的情況）；`format_context()`新增輸出每個辦公室的「來源：」那一行。`dynamic_contacts_for_office()`只有`_lookup_one()`一個呼叫者（已查證），改動安全，不影響其他呼叫端。
+
+### 驗證結果
+
+1. **模組自帶self-test**（`python -m rag.skills.office_lookup_skill`）——正常執行，第一次「看得見」`page_url`——順便發現5個舊有短名辦公室（生僑組/住宿組/出納組/國際合作事務處/教務處）全部指向同一個URL，查證後確認這是`OFFICE_SOURCES`裡**既有、刻意的設計**（那頁本來就同時提到這幾個辦公室），不是這次修法造成的問題，只是之前從未被印出來過
+2. **`OfficeLookupSkill().run(['教務長室', '住宿輔導組'])`**——目標案例（catalog全名，`_find_pages()`從未涵蓋過）：兩個都各自拿到不同、確實相關的URL，不再是`None`
+3. **production回歸**：`python -m rag.proto3_langgraph "如何辦理休學" --no-eval`正常執行不受影響（`rag/nodes/office_lookup.py`同樣呼叫`format_context()`，兩套pipeline共用這次修正的效益）
+4. **migration回歸，n=3**：
+   - 單一查詢「如何辦理休學」1次——最終答案沒有引用office URL，判斷合理（該答案裡的辦公室全部是同一個休學程序的蓋章站點，內容圍繞單一主頁面，LLM選擇只引用主頁面是合理的合成判斷，不是資料遺漏）
+   - **複合查詢「如何辦理休學，圖書館的電話是多少」2次，2次都正確引用圖書館URL**（`https://www.lib.nccu.edu.tw/p/404-1000-312.php?Lang=zh-tw`）——這正是驅動這次調查的原始案例，確認修好且穩定
+
+### 結論
+
+Data層的缺口（URL存在但傳不到`synthesis_node`）已修好且驗證穩定；LLM最終會不會把URL寫進答案，會依內容脈絡（同主題站點 vs 獨立主題）合理判斷，不是隨機遺漏。原始觸發這次調查的複合查詢案例（圖書館聯絡資訊沒有來源可引用）確認解決。
+
+---
 
 ### Step 7：`self_eval_node`兩階段設計實作（Part 6.2/6.3已定案）
 **改動**：實作Stage 1（deterministic checklist，複用production `_SELF_EVAL_CRITERIA`風格＋agentic D15結構化資料當比對依據）+ Stage 2（agentic版`_SELF_EVAL_PROMPT`單一LLM判斷，只在Stage 1通過才執行）。**明確：對所有路徑（含Plan_node直接分流成功的案例）一致執行，不做任何「路徑看起來簡單就跳過」的優化**（§6.3撤回理由：路徑順利不代表答案正確，`_detect_offices()`過去14/15失敗案例都是「一次分到位」的路徑）。

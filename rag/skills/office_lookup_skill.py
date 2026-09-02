@@ -369,12 +369,13 @@ def _load_contacts_index() -> dict[str, list[dict]]:
     return by_name
 
 
-def dynamic_contacts_for_office(office: str) -> list[dict]:
+def dynamic_contacts_for_office(office: str) -> tuple[list[dict], list[str]]:
     """
     Primary contact lookup for `office` (Phase F condition 4) — queries
     office_contacts_index.jsonl, parses each matching record's raw text, and
-    merges results (deduped by extension). Returns [] if `office` resolves
-    to no records at all — caller falls back to KNOWN_CONTACTS in that case.
+    merges results (deduped by extension). Returns ([], []) if `office`
+    resolves to no records at all — caller falls back to KNOWN_CONTACTS in
+    that case.
 
     `office` is tried two ways (2026-08-30, agentic_main.py integration):
     1. As a literal record name already present in the index -- e.g. what
@@ -387,20 +388,38 @@ def dynamic_contacts_for_office(office: str) -> list[dict]:
        extended further, since maintaining that map for every possible
        short/full-name pair is exactly the whack-a-mole pattern path 1
        exists to avoid.
-    """
+
+    2026-09-01 addition: also returns the source URL(s) each matched
+    record carries (office_contacts_index.jsonl's own "url" field, present
+    on every record — confirmed, not something that needs backfilling).
+    This was previously read and then silently discarded — the function
+    only ever extracted parse_office_contacts(rec["text"]) and dropped
+    rec["url"] on the floor. That's the direct cause of a real gap: a
+    catalog-full-name office resolved via path 1 above (e.g. "教務長室")
+    has no entry in OFFICE_SOURCES (the ~9-short-name-keyed dict
+    _find_pages() below reads), so _lookup_one()'s page_url stayed None
+    for every such office even though contacts resolved correctly — the
+    contact_node answer had real names/extensions but nothing to cite as
+    a source. Returning urls here lets _lookup_one() use this index's own
+    URL as a fallback source when the legacy _find_pages() path (below)
+    doesn't cover the office."""
     index = _load_contacts_index()
     record_names = [office] if office in index else _OFFICE_NAME_MAP.get(office, [])
 
     contacts: list[dict] = []
     seen_exts: set[str] = set()
+    urls: list[str] = []
     for record_name in record_names:
         for rec in index.get(record_name, []):
+            url = rec.get("url")
+            if url and url not in urls:
+                urls.append(url)
             for c in parse_office_contacts(rec.get("text", "")):
                 if c["ext"] in seen_exts:
                     continue
                 seen_exts.add(c["ext"])
                 contacts.append(c)
-    return contacts
+    return contacts, urls
 
 
 # Static fallback only — used when dynamic_contacts_for_office() finds nothing
@@ -570,13 +589,22 @@ class OfficeLookupSkill:
         """
         # Condition 4: dynamic lookup is primary; KNOWN_CONTACTS is the
         # fallback only when the dynamic index has nothing for this office.
-        contacts = dynamic_contacts_for_office(office) or KNOWN_CONTACTS.get(office, [])
+        contacts, dynamic_urls = dynamic_contacts_for_office(office)
+        if not contacts:
+            contacts = KNOWN_CONTACTS.get(office, [])
         entry: dict = {
             "office":    office,
             "floor":     KNOWN_FLOORS.get(office),
             "phones":    [],
             "contacts":  contacts,
-            "page_url":  None,
+            # 2026-09-01: seed page_url from the dynamic index's own URL
+            # (always present per-record, confirmed) so a catalog-full-name
+            # office _find_pages() below has no entry for (e.g. "教務長室")
+            # still gets a citable source. _find_pages() below overrides
+            # this with its own (curated, OFFICE_SOURCES-verified) URL when
+            # it does cover the office -- that path takes priority, this is
+            # only the fallback for what it doesn't reach.
+            "page_url":  dynamic_urls[0] if dynamic_urls else None,
             "note":      "",
         }
 
@@ -656,6 +684,15 @@ class OfficeLookupSkill:
                 if c.get("email"):
                     detail += f"  {c['email']}"
                 lines.append(detail)
+            # 2026-09-01: page_url was already computed in _lookup_one() (via
+            # _find_pages() or, as of this fix, office_contacts_index.jsonl's
+            # own url as a fallback) but never actually printed here -- the
+            # direct cause of CONTACT-path answers having real names/
+            # extensions but no citable source. synthesis_node's own prompt
+            # rule ("回答最後附上來源URL") can only follow through on this if
+            # the URL is somewhere in the text it reads.
+            if info.get("page_url"):
+                lines.append(f"    來源：{info['page_url']}")
         return "\n".join(lines)
 
 
