@@ -349,9 +349,22 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 （順手修正一個文件本身的小問題：這節先前意外重複貼了兩次同樣的段落，這次一併清掉。）
 
-### Step 5：`synthesis_node`統一化 + `extraction.py`整份retire（Part 6.1已定案）
-**改動**：`extraction.py`整份retire——`resource_node`只保留agentic版的`_extract_checklist_blocks`/`_extract_station_roles`/`_offices_from_role_keywords`，不搬`_extract_candidate_notes()`（§6.1理由：whack-a-mole編號慣例列舉，不符合這個專案的設計原則）。
-**驗證**：休學/退宿規定兩份表單（已驗證過D15機制的案例）抽取結果不退步；額外確認一次「KNOWLEDGE路徑頁面有站點/notes但未觸發resource_node」這個已知缺口（§6.1）目前有沒有被任何既有regression案例踩到（預期沒有，用來確認這確實只是理論風險，不是被忽視的真實問題）。
+### Step 5：✅ 已完成（2026-09-01）——`synthesis_node`統一化 + `extraction.py`整份retire
+
+**`extraction.py`整份retire的部分，其實在Step 4就已經完成**（`resource_node`只保留`_extract_checklist_blocks`/`_extract_station_roles`/`_offices_from_role_keywords`，沒有搬`_extract_candidate_notes()`）——這步確認並記錄這個事實，不是重新做一次。
+
+**這步真正新增的內容**：新增`rag/agentic/nodes/synthesis.py`——`synthesis_node`（統一集中，所有路徑的答案撰寫全部收斂到這一個node，`agent_node`自己的`.content`一律discard）+`_render_full_messages`（完整訊息歷史渲染，不截斷）+`_SYNTHESIS_PROMPT`（N.5流程手冊格式規則、N.4表單篩選規則、辦公室聯絡人完整性規則，全部逐字核對搬過來）。
+
+**驗證結果**（2個必要案例，含正式`rag/eval.py`評分）：
+
+| Query | 結果 |
+|---|---|
+| 如何辦理休學 | 3輪，`rag/eval.py`正式評分**25/26**（`refund_table`這次1/2）。**⚠ 訂正（同日發現）**：第一次評分時只記錄了分數，沒有保留當次答案文字，事後才發現這個系統本身有LLM隨機性——每次`.invoke()`可能產生不同答案。事後拿`step5_xiuxue.log`裡另一次的答案文字直接核對`refund_table`關鍵字（`全額退費`/`2/3`/`1/3`/`三分之二`/`三分之一`/`退費`，`min_hits=3`），命中3個應該滿分，證明我原本「這是已記載的自然波動」這句話是沒有查證就下的斷言。改成「答案文字＋評分」綁在同一次執行重跑一次，這次結果**26/26滿分**。誠實結論：這個pipeline重複執行下分數落在25-26/26區間（跟`agentic_main.py`既有基準一致），但**沒有針對「25/26那次具體缺在哪」做過查證**，不應該具體斷言是哪個criteria的已知波動——之後要評分驗證，必須把答案文字跟分數存在同一次紀錄裡，才能回頭稽核。答案本身（不論哪一次執行）都完整重現流程手冊格式，7個站點全部有真實聯絡人，教務長三層審核完整 |
+| 退宿規定 | 4輪，答案完整重現N.5修好的「須先至住宿組核章→再至出納組繳費」routing細節，5級距退費比例表完整（含新生vs續住宿生區分） |
+
+**「已知缺口」的sanity check**：§6.1記錄的理論缺口（KNOWLEDGE路徑頁面有站點/notes但未觸發`resource_node`）——這輪連同Step 3-5總共測過的5個查詢（休學/選課上限/退宿規定/出納組電話/表單下載），沒有一個案例踩到這個缺口（凡是有結構化內容的頁面，都是透過表單編號正確觸發`resource_node`）。確認目前仍只是理論風險，沒有實際證據顯示是被忽視的真實問題。
+
+`git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`/`rag/agent_runtime.py`完全未被觸碰。
 
 ### Step 6：複合query處理遷移（`Send` vs nested-invoke，取決於Part 6討論或當下技術驗證）
 **改動**：`decomposition.py`的keyword偵測邏輯沿用；`sub_query_node`／`merge_node`換成`multi_sub_query_node`的nested-invoke模式。**明確待辦，不在這步解決**：要不要把nested-invoke也升級成`Send`（`Send`分支指向一個內部做nested`.invoke()`的wrapper node，這是spike_nested_invoke.py驗證過的安全模式，不是production現有的直接`Send`模式）——先用v1序列版驗證正確性，比照當初agentic_main.py自己的D14先例（先序列驗證，Send升級列為明確後續）。
