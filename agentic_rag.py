@@ -40,7 +40,7 @@ from rag.agentic.logic.rewrite import _render_messages
 from rag.agentic.tools import TOOLS
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     g = StateGraph(AgentState)
     g.add_node("plan_node", plan_node)
     g.add_node("rewrite_node", rewrite_node)
@@ -67,15 +67,24 @@ def build_graph():
     g.add_edge("synthesis_node", "self_eval_node")
     g.add_conditional_edges("self_eval_node", _after_self_eval, {"end": END, "rewrite": "rewrite_node", "plan": "plan_node"})
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
+
+
+def initial_state(query: str, subdomain_hint: str | None = None) -> AgentState:
+    """Shared per-turn starting state -- used by both the CLI's run() (no
+    checkpointer, always a fresh conversation) and server.py (checkpointer-
+    backed, one call per turn on a possibly-existing thread_id). Kept in one
+    place so a future field never gets added to one caller and silently
+    missed in the other."""
+    return {
+        "query": query, "subdomain_hint": subdomain_hint, "query_type": None, "turn": 0, "rewritten": "",
+        "stuck_turns": 0, "messages": [], "answer": None, "self_eval_note": None,
+    }
 
 
 def run(query: str, subdomain_hint: str | None = None, stream: bool = False) -> dict:
     graph = build_graph()
-    initial: AgentState = {
-        "query": query, "subdomain_hint": subdomain_hint, "query_type": None, "turn": 0, "rewritten": "",
-        "stuck_turns": 0, "messages": [], "answer": None, "self_eval_note": None,
-    }
+    initial = initial_state(query, subdomain_hint)
 
     if stream:
         final_state = dict(initial)

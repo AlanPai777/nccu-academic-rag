@@ -13,7 +13,7 @@ always discarded, never used as an answer.
 
 from __future__ import annotations
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from rag.llm_client import simple_chat
 from rag.agentic.state import AgentState
@@ -67,4 +67,13 @@ def synthesis_node(state: AgentState) -> dict:
     history = _render_full_messages(state["messages"])
     prompt = _SYNTHESIS_PROMPT.format(query=state["query"], history=history)
     answer = simple_chat(messages=[{"role": "user", "content": prompt}])
-    return {"answer": answer}
+    # Also append to messages (not just state["answer"]) so the conclusion
+    # survives into the next turn via the add_messages reducer -- state["answer"]
+    # itself gets reset to None by every new turn's initial_state() and no node
+    # reads it directly, so without this the answer would otherwise be
+    # unreachable from messages, which is what every node's context-building
+    # actually consumes. Safe against both structural consumers: _after_tools'
+    # marker regex only matches ToolMessage, and _render_full_messages() above
+    # only renders ToolMessage/HumanMessage, so a retry within the same turn
+    # won't cite this AIMessage back to itself as if it were new source content.
+    return {"answer": answer, "messages": [AIMessage(content=answer)]}
