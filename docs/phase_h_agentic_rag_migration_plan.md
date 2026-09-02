@@ -476,9 +476,31 @@ Data層的缺口（URL存在但傳不到`synthesis_node`）已修好且驗證穩
 4. `python rag/keyword_store.py`（database相關module self-test）——全部PASS，確認資料庫產生/查詢相關程式碼完全不受這次刪除影響
 5. `python -m rag.agentic_rag "如何辦理休學"`——`rag/eval.py`正式評分25/26（`contact_info`這次波動，符合這個session一路記錄過的正常範圍，不是刪除造成的退步）
 
-### Step 10：全面regression + CLAUDE.md文件更新
-**改動**：CLAUDE.md的「Agentic RAG System」章節（architecture diagram、eval分數表、already-resolved issues表、所有`python -m rag.proto3_langgraph`指令範例）需要整份更新，反映遷移後的真實現況（`rag/agentic_rag.py`＋新架構）——不能讓文件繼續描述已經刪除的`proto3_langgraph.py`/`retrieval_procedure.py`/`_PROCEDURE_OFFICES`等機制。
-**驗證**：CLAUDE.md原本列出的所有已知issue（KNOWLEDGE路徑不穩定/CONTACT source attribution/LaTeX符號）逐項確認遷移後是否仍然存在，更新狀態。
+### Step 10：全面regression + CLAUDE.md文件更新（✅ 已完成，2026-09-02）
+
+**全面regression結果**（`python -m rag.agentic_rag`，8題，涵蓋knowledge/procedure-shaped/resource-shaped/contact/compound全部路徑）：
+
+| 題目 | 路徑 | 結果 |
+|---|---|---|
+| 如何辦理休學 | knowledge | **26/26**（`rag/eval.py`正式評分，13項全過） |
+| 如何辦理復學 | knowledge | 正確，有引用來源 |
+| 在職生怎麼辦理復學 | knowledge | 正確fallback到一般流程，誠實註明查無在職生專屬規定，有引用來源 |
+| 退宿規定 | knowledge (osa) | 正確，有引用來源 |
+| 選課上限幾學分 | knowledge | 正確，有引用來源——歷史上最不穩定的KNOWLEDGE路徑案例，這次無失敗 |
+| 出納組電話幾號 | knowledge | 正確，有引用來源（見下方分機號碼資料品質備註） |
+| 休學申請表在哪裡下載 | knowledge (resource-shaped) | 正確透過marker觸發`resource_node`給出QP-T01-03-02的moltke下載連結，有引用來源 |
+| 如何辦理休學，圖書館的電話是多少 | compound | 兩個子問題都正確回答，各自有正確且不同的來源URL——`multi_sub_query_node`當初的原始動機案例 |
+
+備註：出納組電話幾號的答案同時列出兩個不同分機（62123/62120），查證為語料庫本身跨頁面資料不一致（先前研究已獨立記錄過），不是pipeline缺陷——agent忠實回報各來源各自寫的號碼，沒有武斷選一個。
+
+**已知issue逐項確認**：
+1. **KNOWLEDGE路徑不穩定**——E7本身這次遷移刻意不移植（§6.4），失敗模式已從「靜默給錯誤答案」變成「誠實答不出來」；`agentic_main.py`階段驗證過的多項架構改動（subdomain scoping+fallback、grep去重、拿掉`_MAX_TURNS`硬上限、few-shot範例）這次regression run裡「選課上限幾學分」正確回答、無fallback觸發。**不宣稱已解決**——這是LLM取樣變異，不是deterministic bug，單次成功不能證明穩定性，狀態更新為「已大幅緩解，未證實穩定」而非「已解決」。
+2. **CONTACT source attribution**——**已解決**（這次migration session、Step 10之前完成的旁支修正）：`office_lookup_skill.py`的`dynamic_contacts_for_office()`現在把每筆記錄自己的`url`欄位帶到`format_context()`，CONTACT路徑跟marker觸發的`contact_node`都能正確引用來源。這次regression的出納組電話幾號跟複合查詢兩題都確認有`來源：`。
+3. **$\rightarrow$ LaTeX符號**——仍然存在，這次休學申請表答案裡出現一次。維持認定為cosmetic issue，`rag/eval.py`兩種格式都算分。
+
+**CLAUDE.md更新**：「Agentic RAG System」章節整份改寫——architecture diagram反映`rag/agentic_rag.py`+`rag/agentic/`套件結構（無獨立PROCEDURE路徑、self_eval全路徑統一執行、無retry上限）；Key modules表改列`rag/agentic/`實際檔案；Eval分數表新增本次26/26結果，舊Proto 3列標記為已刪除/historical；新增「How Phase E's persistent failures are addressed post-migration」對照表（取代原本的Phase E解法表）；Known issues三項全部更新狀態（見上）；所有指令範例從`python -m rag.proto3_langgraph`改為`python -m rag.agentic_rag`。
+
+**⚠ 事後訂正（2026-09-02，同一天，使用者發現）**：CLAUDE.md第一版architecture diagram畫錯了`resource_node`/`contact_node`的進入方式——只畫出`_after_tools`的marker-triggered mid-loop路徑，漏畫`plan_node`（`_after_plan`）本身就有的直接RESOURCE/CONTACT分流。查證`rag/agentic/nodes/plan.py`的`_after_plan()`：`qt=="contact"→"contact"`、`qt=="resource"→"resource"`，是跟`"compound"`/`"knowledge"`並列的4選1真實分支，不是只有marker才能觸發；`contact_node`自己的docstring也明講「Deterministically routed here by `_after_tools`, `_after_resource`, or `_after_plan`」，三個閘門缺一沒畫。這其實是這份migration plan文件Part 4自己早就畫對的架構（見197-239行的target diagram、Step 4驗證表「出納組電話幾號｜1輪：`plan_node→contact_node`直接分流成功」）——CLAUDE.md改寫時沒有回頭比對這份文件既有內容，憑記憶重畫才畫錯。已修正CLAUDE.md diagram（resource_node/contact_node改畫成兩個進入點都畫出、且都收斂回`rewrite_node`），本文件Part 4/Step 4既有記錄本身不需要改動，錯誤只發生在CLAUDE.md這次重寫。
 
 ---
 
