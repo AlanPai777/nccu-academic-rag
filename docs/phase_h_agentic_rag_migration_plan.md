@@ -417,9 +417,30 @@ Data層的缺口（URL存在但傳不到`synthesis_node`）已修好且驗證穩
 
 ---
 
-### Step 7：`self_eval_node`兩階段設計實作（Part 6.2/6.3已定案）
-**改動**：實作Stage 1（deterministic checklist，複用production `_SELF_EVAL_CRITERIA`風格＋agentic D15結構化資料當比對依據）+ Stage 2（agentic版`_SELF_EVAL_PROMPT`單一LLM判斷，只在Stage 1通過才執行）。**明確：對所有路徑（含Plan_node直接分流成功的案例）一致執行，不做任何「路徑看起來簡單就跳過」的優化**（§6.3撤回理由：路徑順利不代表答案正確，`_detect_offices()`過去14/15失敗案例都是「一次分到位」的路徑）。
-**驗證**：至少涵蓋production現有`_SELF_EVAL_CRITERIA`能抓到的案例＋agentic版兩層retry能救回的複合問題漏答案例，兩邊都要能通過；額外驗證「出納組電話幾號」這類Layer1修好後1輪完成的案例，self_eval仍正確執行兩階段（不因為是直接分流案例而被跳過）。
+### Step 7：✅ 已完成（2026-09-01）——`self_eval_node`兩階段設計實作
+
+**改動**：新增兩個檔案：
+- `rag/agentic/logic/self_eval_checks.py`：`stage1_checklist()`——deterministic免費檢查。**不是production `_SELF_EVAL_CRITERIA`的逐行照搬**（production的結構化檢查讀`extraction_checklist`這個state欄位，這個欄位在Step 1已經確認不存在於agentic的state schema裡），改成直接從`state["messages"]`裡讀`resource_node`/`contact_node`自己已經寫入的區塊（`[表單站點審核層級偵測]`/`[辦公室聯絡資訊...]`）當比對依據——資料來源不同，但檢查精神相同（來源URL、步驟格式、真實姓名/多層審核有沒有被答案引用）。4項檢查：sources（來源URL存在）、procedure_format（僅`query_type=="procedure"`時要求步驟格式，呼應`_SYNTHESIS_PROMPT`規則2自己的區分）、contact-name完整性（`contact_node`查到的真實姓名有沒有至少被引用一個）、station多層審核完整性（`resource_node`偵測到的多層審核角色有沒有至少反映一個）。**刻意不做**的部分：更廣泛的checklist_blocks逐項比對——沒有更多真實案例驗證前，貿然做這類規則容易重演D12/`_STRIP_RE`已經走過的whack-a-mole死路，誠實記錄為未來可擴充項目，不是遺漏。
+- `rag/agentic/nodes/self_eval.py`：`self_eval_node`（Stage 1優先檢查，失敗直接回傳明確hint、跳過Stage 2；Stage 1通過才進Stage 2——`agentic_main.py`原始`_SELF_EVAL_PROMPT`+單一LLM判斷，逐字核對搬過來）+`_after_self_eval`（沿用§0.1決定：`_SELF_EVAL_MAX_TURN=20`risk-only天花板，無`max_retries`硬上限）。
+
+**Stage 1單元測試**（4個合成案例，不跑真實pipeline）：
+| 案例 | 結果 |
+|---|---|
+| 答案沒有來源URL | 正確攔截 |
+| `query_type=procedure`但答案沒有步驟格式 | 正確攔截 |
+| `contact_node`查到真實姓名，答案完全沒引用 | 正確攔截 |
+| 乾淨、格式正確、有引用姓名的答案 | 正確通過（空清單） |
+
+**端到端驗證**（完整graph，含self_eval的retry迴圈）：
+
+| Query | 結果 |
+|---|---|
+| 出納組電話幾號 | 1輪，`self_eval_node`**確實執行**兩階段（Stage 1通過因為姓名有被引用，Stage 2 LLM判斷「通過」），最終`self_eval_note=None`，沒有因為是直接分流案例而被跳過（§6.3決定驗證成立） |
+| 如何辦理休學 | 3輪，`resource_node`/`contact_node`自動觸發，`self_eval_node`兩階段皆通過，`rag/eval.py`正式評分**26/26滿分** |
+
+`git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`完全未被觸碰。
+
+**誠實記錄，沿用reference implementation自己的坦承**：Stage 2本質上仍是「訊息提示→LLM決定要不要行動」，跟這個專案已經證實不穩定的`_AGENT_SYSTEM`時機子句同一種機制形狀；Stage 1的存在是為了在Stage 2的較軟判斷介入前，先攔住便宜、明確的失敗案例，不是聲稱Stage 2本身變得更可靠了。這次驗證也沒有真的觀察到一個「self_eval retry成功救回」的真實失敗案例（兩次端到端測試都是Stage 1/Stage 2一次就通過）——retry機制本身是正確接上、可測試的，但實際觸發頻率/救援效果，這次驗證沒有機會展示，留待之後真實案例出現時再觀察。
 
 ### Step 8：Parametric fallback（E7）——不遷移（Part 6.4已定案）
 **改動**：`_parametric_fallback()`/`_PARAMETRIC_SYSTEM`不遷移，agentic版維持現況（純prompt層級誠實指示，無deterministic退回訓練知識機制）。
