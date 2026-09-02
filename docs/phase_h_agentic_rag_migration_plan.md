@@ -502,6 +502,31 @@ Data層的缺口（URL存在但傳不到`synthesis_node`）已修好且驗證穩
 
 **⚠ 事後訂正（2026-09-02，同一天，使用者發現）**：CLAUDE.md第一版architecture diagram畫錯了`resource_node`/`contact_node`的進入方式——只畫出`_after_tools`的marker-triggered mid-loop路徑，漏畫`plan_node`（`_after_plan`）本身就有的直接RESOURCE/CONTACT分流。查證`rag/agentic/nodes/plan.py`的`_after_plan()`：`qt=="contact"→"contact"`、`qt=="resource"→"resource"`，是跟`"compound"`/`"knowledge"`並列的4選1真實分支，不是只有marker才能觸發；`contact_node`自己的docstring也明講「Deterministically routed here by `_after_tools`, `_after_resource`, or `_after_plan`」，三個閘門缺一沒畫。這其實是這份migration plan文件Part 4自己早就畫對的架構（見197-239行的target diagram、Step 4驗證表「出納組電話幾號｜1輪：`plan_node→contact_node`直接分流成功」）——CLAUDE.md改寫時沒有回頭比對這份文件既有內容，憑記憶重畫才畫錯。已修正CLAUDE.md diagram（resource_node/contact_node改畫成兩個進入點都畫出、且都收斂回`rewrite_node`），本文件Part 4/Step 4既有記錄本身不需要改動，錯誤只發生在CLAUDE.md這次重寫。
 
+### Step 10之後的後續重構：entry point改名＋搬到repo root（2026-09-02，同一天）
+
+**背景**：Step 10文件更新確認完畢後，接續討論README/setup.md/architecture.md三份新文件的規劃，過程中討論到entry point命名——查證NousResearch/hermes-agent、openclaw、tmux三個參考專案，發現它們的entry point命名慣例都是「跟專案/系統名稱本身綁定」（`hermes_cli`/`openclaw`/`tmux`），不是通用的`main.py`；且`rag/main.py`這個檔名目前被classic RAG佔用，若比照這個慣例把`agentic_rag.py`直接改叫`main.py`，反而會跟原本的「main.py」語意衝突（掩蓋了兩套系統的身份），使用者因此提出更對稱的命名：`agentic_rag.py`維持原名，`rag/main.py`改叫`rag/classic_rag.py`，兩者對稱地標示各自是哪套系統。
+
+**實際改動**：
+1. `git mv rag/main.py rag/classic_rag.py`——純改名，仍留在`rag/`底下，不搬家。
+2. `git mv rag/agentic_rag.py agentic_rag.py`——搬到repo root，檔名不變。
+
+**兩種呼叫方式（直接執行`python x.py`／模組式`python -m x`）的相容性查證**（動手改之前，使用者要求先查證兩次執行方式都要能用，不能憑印象假設）：
+- `rag/main.py`（now `rag/classic_rag.py`）第19-20行本來就有`ROOT = Path(__file__).parent.parent; sys.path.insert(0, str(ROOT))`——手動把repo root塞進`sys.path`，這是專門讓「直接執行腳本」（`python rag/classic_rag.py --app`）能正常`from rag.xxx import ...`的既有workaround，不受檔名影響，改名後繼續有效；`python -m rag.classic_rag --app`（模組呼叫，需從repo root執行）也不受影響，因為`-m`本身就會把CWD塞進`sys.path[0]`。
+- `rag/agentic_rag.py`（now `agentic_rag.py`）原本完全沒有這段patch，只支援`python -m rag.agentic_rag "..."`——經`python -c`模擬`sys.path[0]`驗證，若當時直接執行`python rag/agentic_rag.py "..."`會撞到`ModuleNotFoundError`（只是沒人這樣呼叫過，CLAUDE.md/本文件從頭到尾都只示範`-m`用法，所以沒被發現）。搬到repo root後這個限制自動消失——腳本自己所在目錄就是repo root，`python agentic_rag.py "..."`跟`python -m agentic_rag "..."`兩種都不需要任何程式碼改動就能運作。
+
+**驗證**（避開任何會動到build artifact的指令，只驗證agentic側，不主動執行classic RAG——使用者說明classic RAG已經很久沒跑，很多環境細節不確定，不應該在這次改名過程中意外觸發它）：
+1. `python agentic_rag.py --help`／`python -m agentic_rag --help`——兩種都正常印出argparse說明，確認所有`rag.agentic.*`的module-level import都正確解析，無`ModuleNotFoundError`
+2. `python agentic_rag.py "出納組電話幾號" --subdomain aca --no-eval`——實際查詢一次，答案內容跟Step 10 regression跑出來的一致，確認搬家後端到端行為沒有改變
+
+**連帶更新的檔案**：
+- `agentic_rag.py`／`rag/classic_rag.py`自己的docstring（開頭說明＋argparse epilog範例）都改成新檔名/新呼叫方式
+- `rag/agentic/state.py`第3行、`rag/agentic/nodes/compound.py`第42行——兩處docstring順帶提到舊檔名`rag/agentic_rag.py`的地方，更新成`agentic_rag.py`（repo root）
+- CLAUDE.md：所有`python -m rag.agentic_rag`指令範例改成`python agentic_rag.py`，所有`python rag/main.py`改成`python rag/classic_rag.py`，「Running — Classic RAG」章節標題與Module responsibilities表格的`main.py`列一併更新；`rag/agentic_main.py`（研究用的prototype檔案，跟這次改名的`agentic_rag.py`是不同檔案）沒有被誤觸碰，逐一核對過
+
+**尚未觸碰、故意保持不動的部分**（使用者明確指示）：先前已標記狀態未commit的檔案（`PROGRESS_REPORT_V1.md`/`docs/phase_g_brainstorming.txt`/`docs/phase_g_clean_pipeline_design.md`/`docs/phase_g_clean_pipeline_implementation_report.md`/`tutorial_proto3/`）跟已刪除狀態的`docs/phase_f_step1_eval_baseline.md`，這次改名/搬家沒有動它們，維持原狀。
+
+**尚未決定、留給下一輪（README/setup.md/architecture.md規劃）處理**：`rag/agentic/`套件本身要不要也搬出`rag/`（Part 7規劃的完整拆分）——這次只搬了entry point本身，`rag/agentic/`內部15個檔案的`from rag.xxx import`都沒有動，維持先前討論的「先做最小改動，完整拆分留到共用工具真的需要獨立package時再做」的決定，不是這次範圍。
+
 ---
 
 ## Part 7：程式碼組織——`rag/agentic/`套件結構（tools/logic/nodes三層）

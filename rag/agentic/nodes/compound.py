@@ -39,7 +39,7 @@ _loop_graph_cache = None
 def _build_loop_graph():
     """Compiles rewrite_node<->agent_node<->tools (plus resource_node/
     contact_node's marker chain) as an INDEPENDENT StateGraph, separate
-    from the outer graph (rag/agentic_rag.py, Step 9) -- reused by
+    from the outer graph (agentic_rag.py at repo root, Step 9) -- reused by
     multi_sub_query_node's nested .invoke() calls so each sub-query gets
     its own fully isolated turn/rewritten/subdomain_hint/query_type, with
     zero risk of the concurrent-write InvalidUpdateError a shared graph

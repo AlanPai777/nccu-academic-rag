@@ -1,13 +1,18 @@
 """
-main.py — Unified CLI entry point for the NCCU RAG system.
+rag/classic_rag.py — Unified CLI entry point for classic (embedding-based) RAG.
+
+Renamed from rag/main.py (post-Step-10 reorg, docs/phase_h_agentic_rag_migration_plan.md)
+so the filename doesn't collide in meaning with the repo-root agentic_rag.py,
+which is production. This file is unchanged otherwise -- still stable,
+not part of active development.
 
 Commands:
-    python rag/main.py --build-index         # embed + index all chunks (Qdrant + FTS5)
-    python rag/main.py --build-index --reset # drop collection and rebuild
-    python rag/main.py --build-fts           # build FTS5 keyword index only (fast, no embedding)
-    python rag/main.py --query "..."         # single Q&A in terminal
-    python rag/main.py --app                 # launch Gradio web UI
-    python rag/main.py --app --port 7861     # custom port
+    python rag/classic_rag.py --build-index         # embed + index all chunks (Qdrant + FTS5)
+    python rag/classic_rag.py --build-index --reset # drop collection and rebuild
+    python rag/classic_rag.py --build-fts           # build FTS5 keyword index only (fast, no embedding)
+    python rag/classic_rag.py --query "..."         # single Q&A in terminal
+    python rag/classic_rag.py --app                 # launch Gradio web UI
+    python rag/classic_rag.py --app --port 7861     # custom port
 """
 
 from __future__ import annotations
@@ -78,12 +83,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python rag/main.py --build-index
-  python rag/main.py --build-index --reset
-  python rag/main.py --query "選課辦法是什麼？"
-  python rag/main.py --query "graduation requirements" --verbose
-  python rag/main.py --app
-  python rag/main.py --app --port 7861 --share
+  python rag/classic_rag.py --build-index
+  python rag/classic_rag.py --build-index --reset
+  python rag/classic_rag.py --query "選課辦法是什麼？"
+  python rag/classic_rag.py --query "graduation requirements" --verbose
+  python rag/classic_rag.py --app
+  python rag/classic_rag.py --app --port 7861 --share
         """,
     )
 

@@ -1,6 +1,6 @@
 """
 rag/agentic/state.py
-Shared LangGraph state schema for rag/agentic_rag.py's pipeline (Migration
+Shared LangGraph state schema for agentic_rag.py's pipeline (repo root, Migration
 Step 1, docs/phase_h_agentic_rag_migration_plan.md Part 5).
 
 ⚠ Revised during Step 3 (2026-09-01), replacing the Step 1 version. The
