@@ -366,9 +366,23 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 `git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`/`rag/agent_runtime.py`完全未被觸碰。
 
-### Step 6：複合query處理遷移（`Send` vs nested-invoke，取決於Part 6討論或當下技術驗證）
-**改動**：`decomposition.py`的keyword偵測邏輯沿用；`sub_query_node`／`merge_node`換成`multi_sub_query_node`的nested-invoke模式。**明確待辦，不在這步解決**：要不要把nested-invoke也升級成`Send`（`Send`分支指向一個內部做nested`.invoke()`的wrapper node，這是spike_nested_invoke.py驗證過的安全模式，不是production現有的直接`Send`模式）——先用v1序列版驗證正確性，比照當初agentic_main.py自己的D14先例（先序列驗證，Send升級列為明確後續）。
-**驗證**：「如何辦理休學，圖書館的電話是多少」這類複合案例，兩個子問題都要完整回答，跟production現有`Send`版本的答案品質對照，不能退步。
+### Step 6：✅ 已完成（2026-09-01）——複合query處理遷移（v1 nested-invoke，非`Send`）
+
+**改動**：新增`rag/agentic/nodes/compound.py`——`_build_loop_graph()`（獨立編譯內層graph，重用`loop.py`/`resource.py`/`contact.py`裡已經搬過的node函式，不重寫邏輯）+`multi_sub_query_node()`（v1序列`for`迴圈，每個子句各自`.invoke()`一次獨立的內層graph，`try/except`包住避免單一子句失敗拖垮整個複合查詢），逐行核對`agentic_main.py`原始碼搬過來，含完整docstring（引用`spike_send.py`/`spike_nested_invoke.py`兩個驗證過的spike結論）。
+
+**明確不在這步解決**（維持plan原訂範圍）：`Send`升級（`Send`分支指向一個內部做nested`.invoke()`的wrapper node）留作後續，這步只驗證v1序列版本正確性——跟`agentic_main.py`自己當初D14的先例一致。
+
+**驗證方式的調整**：這次記取上一步（Step 5）「答案文字要跟測試結果綁在一起」的教訓，測試腳本直接把答案文字印出來保存，不是只記分數。
+
+**驗證結果**：「如何辦理休學，圖書館的電話是多少」——兩個子問題都完整、正確回答，沒有互相污染：
+- 休學流程：完整4步驟流程手冊格式，7個站點真實聯絡人，教務長三層審核鏈完整
+- 圖書館電話：正確列出6個不同單位分機（總圖/圖書館一般/館長室/綜圖/商圖/傳圖）
+
+`.stream()`顯示`plan_node`（判斷為`compound`）→`multi_sub_query_node`（一次性回傳兩個子句的合併`messages`）→`synthesis_node`——符合設計預期的3-node流程。
+
+**觀察到、但確認是既有限制而非新迴歸的細節**：來源URL只列出休學那頁，圖書館聯絡資訊沒有附URL——這是`contact_node`路徑本身的既有限制（CONTACT查詢跳過retrieval，天生沒有頁面URL可附），CLAUDE.md已經記載這是整個專案層級的已知限制（「CONTACT source attribution」），不是這次遷移或Step 6引入的新問題。
+
+`git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`完全未被觸碰，這步純新增`compound.py`一個檔案。
 
 ### Step 7：`self_eval_node`兩階段設計實作（Part 6.2/6.3已定案）
 **改動**：實作Stage 1（deterministic checklist，複用production `_SELF_EVAL_CRITERIA`風格＋agentic D15結構化資料當比對依據）+ Stage 2（agentic版`_SELF_EVAL_PROMPT`單一LLM判斷，只在Stage 1通過才執行）。**明確：對所有路徑（含Plan_node直接分流成功的案例）一致執行，不做任何「路徑看起來簡單就跳過」的優化**（§6.3撤回理由：路徑順利不代表答案正確，`_detect_offices()`過去14/15失敗案例都是「一次分到位」的路徑）。
