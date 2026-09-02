@@ -324,13 +324,30 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 **過程中的插曲**：驗證途中`from langchain_ollama import ChatOllama`失敗（`ModuleNotFoundError`），連`agentic_main.py`本身（完全沒改動的既有檔案）也一樣失敗——確認是環境問題不是這次改動造成的（推測是稍早venv重新啟用時沒有帶回這個套件），`pip install langchain-ollama`後解決，且`agentic_main.py`本身恢復正常，確認不是這次程式碼改動的鍋。
 
-### Step 4：`resource_node`／`contact_node`換成agentic版
-**改動**：`office_lookup.py`的`_PROCEDURE_OFFICES`硬編碼fallback整個拿掉，換成`_detect_offices()`；`retrieval_resource.py`換成fetch-all版本，`_RESOURCE_SYNTHESIS_PROMPT`的「防編造連結」精神併入`synthesis.py`的共用prompt（不是resource自己保留一份獨立synthesis）。
-**驗證**：出納組電話幾號（1輪，Layer1修好的案例）／休學表單下載／休學表單裡7+個蓋章站點的聯絡人完整度（比對D12/N.7已經在`agentic_main.py`驗證過的結果，遷移後應該要重現同樣的完整度，不能退步）。
+### Step 4：✅ 已完成（2026-09-01）——`resource_node`／`contact_node`換成agentic版
 
-### Step 4：`resource_node`／`contact_node`換成agentic版
-**改動**：`office_lookup.py`的`_PROCEDURE_OFFICES`硬編碼fallback整個拿掉，換成`_detect_offices()`；`retrieval_resource.py`換成fetch-all版本，`_RESOURCE_SYNTHESIS_PROMPT`的「防編造連結」精神併入`synthesis.py`的共用prompt（不是resource自己保留一份獨立synthesis）。
-**驗證**：出納組電話幾號（1輪，Layer1修好的案例）／休學表單下載／休學表單裡7+個蓋章站點的聯絡人完整度（比對D12/N.7已經在`agentic_main.py`驗證過的結果，遷移後應該要重現同樣的完整度，不能退步）。
+**改動**：新增以下檔案，全部逐行核對`agentic_main.py`原始碼後搬過來：
+- `rag/agentic/logic/form_extraction.py`：`_list_forms_metadata`/`_judge_forms`（含§N.1/N.3撤回教訓的完整docstring）/`_extract_station_roles`/`_offices_from_role_keywords`/`_extract_checklist_blocks`（D15）/`_FORM_JUDGE_PROMPT`/`_FORM_MARKER_RE`
+- `rag/agentic/logic/office_detection.py`：追加`_OFFICE_MARKER_RE`（Step 3已有`_detect_offices()`本體，這步補上markers的canonical位置）
+- `rag/agentic/nodes/resource.py`：`resource_node`（N.4 fetch-all設計）+`_after_resource`
+- `rag/agentic/nodes/contact.py`：`contact_node`
+- `rag/agentic/nodes/loop.py`：追加`_after_tools`（含doom-loop`_MAX_STUCK`偵測）
+
+**設計筆記**：`_FORM_MARKER_RE`/`_OFFICE_MARKER_RE`原本考慮各自在`resource.py`/`loop.py`裡各自定義一份（跟`agentic_main.py`單檔案內共用全域常數的原始寫法不同，這次拆成多檔案後需要重新決定歸屬），改成各自歸屬到偵測邏輯的owning module（`_FORM_MARKER_RE`跟著`form_extraction.py`、`_OFFICE_MARKER_RE`跟著`office_detection.py`），`resource.py`/`loop.py`都改成import，避免同一個regex字串在兩個檔案裡各自維護一份、以後修改容易漏掉一邊。
+
+**production對照**：`office_lookup.py`的`_PROCEDURE_OFFICES`硬編碼fallback、`retrieval_resource.py`的舊版邏輯，都還沒被刪除（留到Step 9），這步純新增。
+
+**驗證結果**（3個案例，全部跟`agentic_main.py`參考行為逐項比對）：
+
+| Query | 結果 | 比對 |
+|---|---|---|
+| 出納組電話幾號 | 1輪：`plan_node→contact_node`直接分流成功（非no-op），真實聯絡資料（出納組7位員工姓名/分機/email） | 跟N.7 Layer 1修好後的驗證結果一致 |
+| 休學申請表在哪裡下載 | 1輪：`plan_node→resource_node`（`_judge_forms()`成功抓到表單）→`contact_node`（偵測到10個辦公室，含`教務長室`） | 跟D1/N.7既有驗證結果一致 |
+| 如何辦理休學 | 3輪：`search_texts`→`get_page_tool`（3個表單編號）→`resource_node`→`contact_node`自動觸發（deterministic marker鏈），偵測到全部10個辦公室（含`教務長室`/`住宿輔導組`/`生活事務暨僑生輔導組`/`原住民族學生資源中心`這幾個先前的語意判斷難案例） | 跟D12/N.7既有驗證結果一致，`resource_node→contact_node`鏈路自動觸發、agent沒有否決權（D3/D6原則）正確運作 |
+
+`git status`確認`rag/nodes/`/`rag/proto3_langgraph.py`/`rag/agent_runtime.py`完全未被觸碰。
+
+（順手修正一個文件本身的小問題：這節先前意外重複貼了兩次同樣的段落，這次一併清掉。）
 
 ### Step 5：`synthesis_node`統一化 + `extraction.py`整份retire（Part 6.1已定案）
 **改動**：`extraction.py`整份retire——`resource_node`只保留agentic版的`_extract_checklist_blocks`/`_extract_station_roles`/`_offices_from_role_keywords`，不搬`_extract_candidate_notes()`（§6.1理由：whack-a-mole編號慣例列舉，不符合這個專案的設計原則）。

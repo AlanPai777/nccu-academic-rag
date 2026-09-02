@@ -24,6 +24,12 @@ import re
 from rag.llm_client import simple_chat
 from rag.domain_router import _keyword_table
 
+# Marker _detect_offices()'s callers (get_page_tool, resource_node) embed
+# in their returned text so _after_tools/_after_resource can detect,
+# without re-running detection, whether the last message already carries
+# an office-detection result.
+_OFFICE_MARKER_RE = re.compile(r"\[偵測到辦公室: ([^\]]+)\]")
+
 _OFFICE_JUDGE_PROMPT = """以下文字裡可能提到了一些政大的辦公室/單位，但提到的名稱常常是簡稱或口語說法，不一定是正式全名（例如文字裡寫「住宿組」，正式全名可能是「住宿輔導組」；文字裡寫「圖書館」，正式全名可能是「圖書館(各組聯絡資訊)」）。
 
 文字內容：

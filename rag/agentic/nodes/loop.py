@@ -16,19 +16,24 @@ call -- this is the core motivation for this migration step.
 
 from __future__ import annotations
 
+import json
 import os
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_ollama import ChatOllama
 
 from rag.domain_router import _layer1_match, layer2_candidates, is_ambiguous
 from rag.agentic.state import AgentState
 from rag.agentic.logic.rewrite import _rewrite_query, _render_messages
+from rag.agentic.logic.form_extraction import _FORM_MARKER_RE
+from rag.agentic.logic.office_detection import _OFFICE_MARKER_RE
 from rag.agentic.tools import TOOLS
+
+_MAX_STUCK = 3  # doom-loop detection only -- no turn-count cap this round, see _after_agent
 
 # Known office mandates -- deliberately incomplete (only core offices seen in
 # testing so far). Other subdomains show "尚無職掌描述" in domain_router_node's
@@ -149,3 +154,28 @@ def _after_agent(state: AgentState) -> str:
     if not getattr(last, "tool_calls", None):
         return "end"
     return "tools"
+
+
+def _after_tools(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if isinstance(last, ToolMessage) and _FORM_MARKER_RE.search(str(last.content)):
+        return "resource"
+    if isinstance(last, ToolMessage) and _OFFICE_MARKER_RE.search(str(last.content)):
+        # Direct page->contact path for pure CONTACT-type queries with no
+        # form involved at all (e.g. "出納組電話幾號") -- get_page_tool sets
+        # this marker itself when it found no form_ids to route through
+        # resource_node instead. When a form IS present, this branch is
+        # never reached (get_page_tool's else-branch skips detection in
+        # that case) -- office detection stays exclusively on
+        # resource_node's freshly-fetched form text.
+        return "contact"
+    # doom-loop: count consecutive AIMessages with identical tool_calls
+    # signature. This is now the ONLY loop-termination safety net -- see
+    # _after_agent.
+    ai_msgs = [m for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls]
+    if len(ai_msgs) >= _MAX_STUCK:
+        sigs = [tuple(sorted((tc["name"], json.dumps(tc["args"], sort_keys=True)) for tc in m.tool_calls))
+                for m in ai_msgs[-_MAX_STUCK:]]
+        if len(set(sigs)) == 1:
+            return "end"
+    return "rewrite"
