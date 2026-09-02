@@ -274,6 +274,12 @@ production的`self_eval_node`有明確`_MAX_SELF_EVAL_RETRIES = 2`；`agentic_ma
 
 **過程中的插曲**：驗證途中一度發現`python`指令完全找不到（`which python`/`type python`皆失敗），排查後確認是使用者本地venv環境意外關閉，不是這次改動造成的問題——venv重新啟用後（`/mnt/d/NCCU_DATA/NCCU-AI-SYSTEM/venv`，在repo外層一層，說明先前用`find`在repo內搜尋找不到venv目錄的原因），全部驗證正常通過。
 
+**⚠ 2026-09-01訂正（Step 3進行中發現，同一天修正）：state.py的schema設計方向錯了，已重寫**——原始版本以production的`AgentState`為基礎、疊加4個欄位，這個判斷有誤：Step 3要搬的`rewrite_node`/`domain_router_node`/`agent_node`/tools（以及後續`resource_node`/`contact_node`/`synthesis_node`/`self_eval_node`）全部建立在`state["messages"]`（LangChain訊息物件）上——`ToolNode`、`InjectedState`、deterministic marker路由（`_after_tools`檢查最後一則`ToolMessage`內容）都依賴這個形狀，這次遷移實際會搬過來的node**沒有一個**讀寫production的`context_pages`/`office_context`/`extraction_checklist`/`sub_queries`等結構化欄位——這些欄位專屬於即將retire的`retrieval_procedure.py`/`retrieval_knowledge.py`/`extraction.py`/`office_lookup.py`/`decomposition.py`的`Send`版`sub_query_node`。直接查`agentic_main.py`原始碼確認：連複合query處理（`multi_sub_query_node`）都是每次重新對`state["query"]`切句，從不讀取一個儲存好的`sub_queries`欄位——證實這個欄位在agentic設計下本來就不需要。
+
+**修法**：`state.py`改成直接對齊`agentic_main.py`自己的`AgenticState`（9個欄位：`query`/`subdomain_hint`/`query_type`/`turn`/`rewritten`/`stuck_turns`/`messages`/`answer`/`self_eval_note`），不是重新設計，是原樣搬既有驗證過的schema。舊版21欄位的草稿整個捨棄。**驗證**：`plan_node`/`_after_plan`（Step 2的產出）重跑一次確認不受影響（它們從未觸碰被移除的欄位）——正常。
+
+**方法論註記**：這是這個session一路強調的「先驗證再往下建」原則的具體案例——如果沒有在Step 3開工前先核對schema跟實際要搬的node程式碼，這個錯誤會被後續5-6個Step的程式碼疊上去，屆時修正成本會高得多。
+
 ### Step 2：✅ 已完成（2026-09-01）——`plan_node`實作，取代`routing.py`+`decomposition.py`
 
 **改動**：新增`rag/agentic/nodes/plan.py`——直接從`agentic_main.py`的`plan_node`/`_after_plan`原樣搬過來（不是重新實作，是既已驗證過的參考實作），`_after_plan`只回傳`compound`/`contact`/`resource`/`knowledge`（PROCEDURE不再是獨立分支，併入`knowledge`）。比照Step 1的模式，**不修改**production現有的`rag/nodes/routing.py`/`rag/nodes/decomposition.py`（留到Step 9才真正刪除），這步純新增檔案。
