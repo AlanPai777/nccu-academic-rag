@@ -82,11 +82,30 @@ def _status_text(node_name: str, delta: dict) -> str | None:
     """
     if node_name == "rewrite_node" and delta.get("rewritten"):
         return f"正在搜尋：{delta['rewritten']}"
-    if node_name in ("domain_router_node", "self_eval_node"):
+    if node_name == "domain_router_node":
         msgs = delta.get("messages") or []
         if msgs:
             return str(msgs[-1].content).split("\n")[0]
+    if node_name == "self_eval_node" and delta.get("self_eval_note"):
+        # self_eval_node's three failure branches (Stage 1 checklist,
+        # 情況A, 情況B) don't all populate `messages` -- 情況B (routes back
+        # to plan_node, which never reads `messages` at all) only sets
+        # self_eval_note. That field is the one signal common to all three,
+        # so it's the correct thing to key off, not `messages`'s presence.
+        msgs = delta.get("messages") or []
+        text = str(msgs[-1].content) if msgs else delta["self_eval_note"]
+        return text.split("\n")[0]
     return _STATIC_STATUS.get(node_name)
+
+
+def _is_retry_signal(node_name: str, delta: dict) -> bool:
+    """True exactly when self_eval_node just rejected the draft synthesis_node
+    answer that already finished streaming into the frontend's answer area --
+    the caller should tell the frontend to file that draft into the thinking
+    log and clear the answer area before the next synthesis_node run starts
+    streaming its replacement. Same self_eval_note-based condition as
+    _status_text above, for the same reason (情況B has no `messages`)."""
+    return node_name == "self_eval_node" and bool(delta.get("self_eval_note"))
 
 
 def _thread_config(session_id: str | None) -> dict:
@@ -121,7 +140,14 @@ async def _pump(
                     await queue.put({"data": chunk.content})
             elif stream_mode == "updates":
                 for node_name, delta in payload.items():
-                    text = _status_text(node_name, delta or {})
+                    delta = delta or {}
+                    # Reset before the status line explaining why -- the
+                    # frontend files the just-cleared draft into its
+                    # thinking log labeled with that reason, so ordering
+                    # them clear-then-explain reads correctly top to bottom.
+                    if _is_retry_signal(node_name, delta):
+                        await queue.put({"type": "reset"})
+                    text = _status_text(node_name, delta)
                     if text:
                         await queue.put({"type": "status", "text": text})
     except Exception as e:  # noqa: BLE001 -- formatted for the user by _generate
