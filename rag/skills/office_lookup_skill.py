@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from rag.agent_tools import grep_texts, get_page
+from rag.llm_client import simple_chat
 
 # Floor info from moltke QP-T01-03-02 + osa refund page.
 # Floors for 生僑組 and 原資中心 are not present in crawled HTML;
@@ -148,10 +149,19 @@ _PURE_NAME_LINE_RE = re.compile(r'^\s*\[?([一-鿿]{2,4})\]?(?:\(https?://[^)]*\
 _EXT_BARE_RE        = re.compile(r'(?<!\()(?<!\d)(\d{5})(?!\d)(?!\))')
 
 
-def _parse_labeled(text: str) -> list[dict]:
+def _parse_labeled(text: str) -> tuple[list[dict], bool]:
+    """Returns (contacts, used_fallback) — used_fallback is True if ANY entry
+    had to fall back to _NAME_TITLE_RE's "name immediately before a known
+    title keyword" guess instead of an explicit "姓名" label. That guess is
+    only reliable when a page's own layout puts the real name adjacent to the
+    title (e.g. "劉桂芬 組長"); it fails badly on markdown-link-name layouts
+    like team.jsp's, where it grabs a fragment of the (unrelated, multi-part)
+    title paragraph instead — see _llm_extract_contacts()'s docstring for the
+    concrete failure this flag exists to catch."""
     ext_matches = list(_EXT_LABELED_RE.finditer(text))
     contacts: list[dict] = []
     seen: set[str] = set()
+    used_fallback = False
     for i, m in enumerate(ext_matches):
         ext = m.group(1)
         if ext in seen:
@@ -172,6 +182,7 @@ def _parse_labeled(text: str) -> list[dict]:
             # found belongs to this block's own owner.
             nt_match = _NAME_TITLE_RE.search(block)
             name = nt_match.group(1) if nt_match else ""
+            used_fallback = True
         if not name:
             continue
         seen.add(ext)
@@ -183,6 +194,62 @@ def _parse_labeled(text: str) -> list[dict]:
             "name": name, "ext": ext,
             "email": email_match.group(1) if email_match else None,
             "duty": duty,
+        })
+    return contacts, used_fallback
+
+
+_CONTACT_EXTRACT_PROMPT = """以下是政大某個辦公室/系所網頁的成員名冊原始文字，裡面每個人可能包含姓名（常常是markdown連結格式 [姓名](網址)，也可能是純文字）、職稱（可能分成好幾段敘述）、電子郵件、校內分機等資訊，版面格式不規則，職稱段落可能很長。
+
+請仔細讀懂這份名冊，抽出裡面每一個「有列出校內分機」的人，注意：
+- name 必須是這個人真正的姓名（通常是2-4個中文字，常常就是markdown連結裡的文字），不可以用職稱、單位名稱、學程名稱等文字充當姓名。
+- 同一個人的姓名、職稱、分機可能分散在不同段落，但彼此相鄰，請根據前後文正確配對，不要把不同人的資訊配對在一起。
+
+原始文字：
+{text}
+
+只回傳一個JSON陣列，不要有其他文字，格式如下：
+[{{"name": "...", "ext": "...", "duty": "...", "email": "..." 或 null}}, ...]
+如果完全沒有任何人列出分機，回傳空陣列 []。"""
+
+
+def _llm_extract_contacts(text: str) -> list[dict]:
+    """LLM-based structured extraction of [{name, ext, duty, email}, ...] from
+    a raw office/dept roster page — the page-level replacement for
+    _parse_labeled()'s output whenever ANY entry there needed the unreliable
+    _NAME_TITLE_RE fallback (found 2026-09-03, docs/debug.md problem 2):
+    that fallback grabs a substring of a person's OWN multi-part title
+    string — e.g. "學位學程" out of "...資訊安全碩士學位學程主任" — instead of
+    their actual name, which on team.jsp-style pages sits nearby as a
+    markdown link the regex never looks at. Rather than trying to patch the
+    regex to cover every page layout NCCU's ~150 subdomains might use, this
+    mirrors office_detection.py's own _detect_offices() pattern: let an LLM
+    read the messy real text and map it against a controlled output shape —
+    reading a roster and pairing each name with its own title/extension is
+    exactly the kind of context-dependent structuring a regex can't do
+    reliably but an LLM does well."""
+    raw = simple_chat(
+        messages=[{"role": "user", "content": _CONTACT_EXTRACT_PROMPT.format(text=text[:15000])}],
+        max_tokens=4000,
+    )
+    try:
+        start, end = raw.index("["), raw.rindex("]") + 1
+        items = json.loads(raw[start:end])
+    except (ValueError, json.JSONDecodeError):
+        return []
+    contacts: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        ext = str(item.get("ext") or "").strip()
+        if not name or not ext.isdigit() or ext in seen:
+            continue
+        seen.add(ext)
+        contacts.append({
+            "name": name, "ext": ext,
+            "email": item.get("email") or None,
+            "duty": str(item.get("duty") or "").strip(),
         })
     return contacts
 
@@ -337,7 +404,15 @@ def parse_office_contacts(text: str) -> list[dict]:
     contact.csv discussion); an office this can't parse falls all the way
     back to KNOWN_CONTACTS via dynamic_contacts_for_office(), not to a guess.
     """
-    contacts = _parse_labeled(text)
+    contacts, used_fallback = _parse_labeled(text)
+    if contacts and used_fallback:
+        # At least one name came from the unreliable title-adjacent guess —
+        # don't trust ANY of this page's Tier 1 output, ask an LLM to read
+        # the whole page instead (see _llm_extract_contacts()'s docstring).
+        llm_contacts = _llm_extract_contacts(text)
+        if llm_contacts:
+            return llm_contacts
+        return contacts  # LLM found nothing usable — fall back to the regex guess
     if contacts:
         return contacts
     tier3 = _parse_title_name_table(text)
