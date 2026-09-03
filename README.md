@@ -38,6 +38,7 @@ Full setup detail (both paths, plus Classic RAG's service requirements) is in [d
 |---|---|
 | Get it running | [docs/setup.md](docs/setup.md) |
 | Understand how the pipeline works | [docs/architecture.md](docs/architecture.md) |
+| Run the SSE API server (connect a frontend) | [docs/setup.md](docs/setup.md#path-1b--run-the-assistant-api-server-for-a-frontend-integration) |
 | Update or expand the crawled corpus | [docs/setup.md](docs/setup.md#path-2--refresh-or-expand-the-corpus) |
 | See why a specific design decision was made | `docs/phase_h_agentic_rag_migration_plan.md` and the other `docs/phase_*` research documents |
 | Run the classic (embedding-based) system | [docs/setup.md](docs/setup.md#classic-rags-services-only-if-running-ragclassic_ragpy), README table above |

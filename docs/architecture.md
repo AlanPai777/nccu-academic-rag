@@ -86,11 +86,55 @@ plan_node — rag/router.py's 2-layer classifier (keyword → LLM fallback).
 - **`self_eval_node` runs on every path**, including ones routed directly — a smooth routing path doesn't guarantee a correct answer. Two-stage: a free deterministic checklist gate first, LLM judgment only if that passes. No hard retry cap, just a generous turn-count ceiling as a safety net.
 - **No parametric fallback.** If retrieval genuinely finds nothing, the system says so — it does not answer from the LLM's own training knowledge. NCCU-specific institutional detail (which office handles what, current phone extensions, form IDs) is exactly the kind of long-tail fact no LLM's training data reliably has right.
 
+## Assistant API server
+
+`server.py` (repo root) wraps the graph above in a FastAPI SSE service for
+`CourseLangChain-frontend`'s "政大 AI 助手" page — the pipeline described so
+far is otherwise unchanged, this is purely a serving layer. Full design
+rationale and implementation findings (including two real bugs found and
+fixed during rollout) are in `docs/phase_i_assistant_api_design.md`; this
+section is the distilled current-state summary.
+
+- **Streaming**: `graph.astream(..., stream_mode=["updates","messages"])`.
+  The `"messages"` stream is filtered to
+  `isinstance(chunk, AIMessageChunk) and metadata["langgraph_node"]=="synthesis_node"`
+  — both conditions matter. `langgraph_node` alone isn't enough because
+  `stream_mode="messages"` surfaces *any* message added to `state["messages"]`
+  by a node's return value, not just live token deltas; `synthesis_node`
+  also appends its answer to `messages` (see below), so without the
+  `isinstance` check the answer streamed twice — once as genuine deltas,
+  once whole as that appended message.
+- **Session memory**: `build_graph(checkpointer=InMemorySaver())` — `server.py`'s
+  only caller that passes a real checkpointer (the CLI's `run()` doesn't).
+  `session_id` maps directly to the LangGraph `thread_id`. In-memory only —
+  no persistence across process restarts.
+- **Cross-turn compaction**: `synthesis_node` appends its answer to
+  `messages` as a plain `AIMessage` (not just `state["answer"]`, which no
+  node reads and which every new turn resets to `None`) so the conclusion
+  survives into the next turn. Before a new turn starts on an existing
+  `thread_id`, `rag/agentic/compaction.py`'s `compact_previous_turn()`
+  collapses the *entire* previous turn's `messages` (candidate lists,
+  fetched pages, form/office text) down to just
+  `[HumanMessage(prev_query), AIMessage(prev_answer)]` via LangGraph's
+  `RemoveMessage` — otherwise `synthesis_node`'s un-scoped
+  `_render_full_messages()` would leak a prior unrelated topic's fetched
+  content into a new turn's synthesis prompt.
+- **Status side channel**: `{"type":"status",...}` events reuse text nodes
+  already generate for their own purposes (`rewrite_node`'s `rewritten`,
+  `domain_router_node`/`self_eval_node`'s injected messages) rather than a
+  dedicated summarizer call. `self_eval_node`'s retry signal
+  (`{"type":"reset"}`, telling the frontend to file a rejected draft into
+  its thinking-log instead of concatenating it with the replacement answer)
+  keys off `self_eval_note` being set, not `messages`'s presence — one of
+  self_eval's three failure branches (情況B) never populates `messages`.
+
 ## Key modules
 
 | Module | Role |
 |---|---|
-| `agentic_rag.py` | Graph assembly + CLI (`--subdomain`/`--stream`/`--no-eval`) |
+| `agentic_rag.py` | Graph assembly + CLI (`build_graph(checkpointer=None)`/`initial_state()`/`--subdomain`/`--stream`/`--no-eval`) |
+| `server.py` | FastAPI SSE server for `CourseLangChain-frontend` — see "Assistant API server" above |
+| `rag/agentic/compaction.py` | `compact_previous_turn()` — cross-turn `messages` compaction via `RemoveMessage`, called by `server.py` |
 | `rag/agentic/nodes/` | Graph-node wrappers: `plan.py`, `loop.py` (rewrite/domain_router/agent), `resource.py`, `contact.py`, `synthesis.py`, `compound.py`, `self_eval.py` |
 | `rag/agentic/logic/` | Pure functions behind the nodes — office/form detection, rewrite, self-eval checks — testable without any graph state |
 | `rag/agentic/tools/` | The 5 tools the agent can call: `search_texts` (FTS5 + LLM-judge), `grep_texts`, `get_page`, `extract_links`, `get_form` |
@@ -105,6 +149,7 @@ plan_node — rag/router.py's 2-layer classifier (keyword → LLM fallback).
 
 ```
 agentic_rag.py               # production entry point (repo root)
+server.py                    # FastAPI SSE server for CourseLangChain-frontend (Phase I)
 
 rag/
 ├── classic_rag.py            # Classic RAG CLI entry point (stable, separate system)
@@ -128,6 +173,7 @@ rag/
 │
 ├── agentic/                  # Agentic RAG's package (imported by ../agentic_rag.py)
 │   ├── state.py                  # AgentState TypedDict
+│   ├── compaction.py             # compact_previous_turn() -- server.py's cross-turn RemoveMessage compaction
 │   ├── nodes/                    # Graph-node wrappers
 │   │   ├── plan.py                   plan_node, _after_plan
 │   │   ├── loop.py                   rewrite_node, domain_router_node, agent_node, tool routing
