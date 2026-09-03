@@ -66,17 +66,14 @@ def synthesis_node(state: AgentState) -> dict:
     tool-selection instructions."""
     history = _render_full_messages(state["messages"])
     prompt = _SYNTHESIS_PROMPT.format(query=state["query"], history=history)
-    # Uses loop.py's already-proven ChatOllama instance (not llm_client.py's
-    # simple_chat(), which calls the raw ollama/openai SDKs directly and is
-    # therefore invisible to LangGraph's stream_mode="messages" token
-    # streaming) so server.py's SSE endpoint can stream this node's answer
-    # token-by-token, filtered by langgraph_node=="synthesis_node". agent_node
-    # already only supports Ollama cloud regardless of LLM_PROVIDER (see
-    # loop.py) -- reusing the same _llm here doesn't introduce a new
-    # inconsistency, it follows the one already established.
-    # .bind() adds an explicit num_predict, same rationale as llm_client.py's
-    # own comment: synthesis answers run long (1000-2000+ tokens), and the
-    # Ollama cloud API needs a positive num_predict, not -1/unlimited.
+    # Uses a ChatOllama instance (not llm_client.py's simple_chat(), which
+    # calls the raw ollama/openai SDKs directly and is therefore invisible
+    # to LangGraph's stream_mode="messages" token streaming) so server.py's
+    # SSE endpoint can stream this node's answer token-by-token, filtered by
+    # langgraph_node=="synthesis_node". .bind() adds an explicit
+    # num_predict, same rationale as llm_client.py's own comment: synthesis
+    # answers run long (1000-2000+ tokens), and the Ollama cloud API needs a
+    # positive num_predict, not -1/unlimited.
     answer = _llm.bind(options={"num_predict": 8192}).invoke([HumanMessage(content=prompt)]).content
     # Also append to messages (not just state["answer"]) so the conclusion
     # survives into the next turn via the add_messages reducer -- state["answer"]

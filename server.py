@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessageChunk
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agentic_rag import build_graph, initial_state
@@ -136,7 +137,21 @@ async def _pump(
         ):
             if stream_mode == "messages":
                 chunk, metadata = payload
-                if metadata.get("langgraph_node") == "synthesis_node" and chunk.content:
+                # isinstance check matters here, not just langgraph_node --
+                # synthesis_node's return value itself adds a *complete*
+                # AIMessage to state["messages"] (Item E, so the next turn
+                # can read the prior conclusion), and stream_mode="messages"
+                # surfaces that addition too, not just live token deltas.
+                # Without this check the full text streams once as genuine
+                # AIMessageChunk deltas, then AGAIN whole as that plain
+                # AIMessage -- confirmed via a live repro against "如何辦理
+                # 休學" (small chunks throughout, one final chunk containing
+                # the entire answer a second time).
+                if (
+                    isinstance(chunk, AIMessageChunk)
+                    and metadata.get("langgraph_node") == "synthesis_node"
+                    and chunk.content
+                ):
                     await queue.put({"data": chunk.content})
             elif stream_mode == "updates":
                 for node_name, delta in payload.items():
