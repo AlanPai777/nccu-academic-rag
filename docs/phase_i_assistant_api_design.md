@@ -199,6 +199,33 @@ character-by-character to the user), so there was no reason to touch them.
 `synthesis_node` follows an existing pattern in this codebase, not a new
 inconsistency introduced by this phase.
 
+## Implementation finding: self_eval retries can duplicate the answer in the frontend, and the fix for it needed a second pass
+
+Once streaming worked, a remaining design gap surfaced during discussion (before it was ever seen live): `self_eval_node` can reject `synthesis_node`'s draft and route back through `rewrite_node`/`plan_node` for another pass -- meaning `synthesis_node` can run more than once within one `/ask` turn. `server.py`'s SSE filter only checked `langgraph_node == "synthesis_node"`, with no way to tell "this turn's rejected draft" apart from "the eventual accepted answer" -- both would stream into the same frontend `output` buffer back to back, with no separator.
+
+**Design choice**: rather than buffering server-side until `self_eval_node` judges the draft (which would kill live typing for *every* turn, not just retried ones -- you don't know a run is "the accepted one" until after it fully finishes generating and gets judged), the frontend keeps streaming live throughout, and a `{"type":"reset"}` event tells it to file the just-typed draft into the thinking-log (`statusLog`) and clear the answer area before the replacement starts typing. The draft isn't lost, just relocated -- and this needs zero server-side buffering, since the frontend already has the full draft text on hand from the live stream by the time reset fires.
+
+**Bug found while implementing the trigger condition**: the natural-seeming detection ("did `self_eval_node`'s delta include a `messages` entry?") misses one of self_eval's three failure branches. `self_eval.py`'s three failure paths:
+- Stage 1 checklist failure → sets both `self_eval_note` and `messages`
+- 情況A (content incomplete) → sets both `self_eval_note` and `messages`
+- 情況B (compound query possibly misclassified, routes back to `plan_node`) → sets **only** `self_eval_note`, no `messages` at all -- because `plan_node` never reads `messages` (confirmed earlier, see Verified code facts above), so there was never a reason for that branch to write one
+
+A `messages`-keyed detector silently misses 情況B: the retry happens, but no reset fires, and the exact same duplication bug reappears through a different branch. Fix: `server.py`'s `_is_retry_signal()` keys off `self_eval_note` being truthy instead -- the one field all three branches set, since it's what the branches actually mean ("a retry is happening"), not `messages`'s presence, which was only ever a side effect of what each branch's *downstream reader* needed (`rewrite_node` reads `messages`; `plan_node` doesn't). Verified with a standalone test feeding all three branches' real `self_eval.py` return shapes into `_is_retry_signal`/`_status_text` directly (no live LLM call needed) -- 情況B correctly triggers `retry=True` after the fix.
+
+## Implementation finding: a second, unrelated duplication bug — `stream_mode="messages"` surfaces state-added messages, not just live tokens
+
+Discovered live-testing "如何辦理休學" after the self_eval-retry fix: the answer still arrived duplicated (same content twice, concatenated with no separator), but with **0 reset events** and only one pass through every node (confirmed via the `updates` stream's status-event count) -- ruling out self_eval retries as the cause entirely. This is a distinct bug from the one above.
+
+**First (wrong) hypothesis**: `synthesis_node`'s `_llm` is the same object `agent_node` uses (via `loop.py`), just with a different `.bind()` view (`.bind(options=...)` vs `.bind_tools(...)`) -- suspected LangGraph's per-node stream tagging was getting confused by two different bound views of one shared instance. Tried giving `synthesis_node` an isolated `ChatOllama` instance; **did not fix it** (confirmed via the same live repro, still duplicated) -- so this was reverted back to sharing `loop.py`'s `_llm` (confirmed via testing, not assumed, that the isolation was never actually the fix).
+
+**Actual root cause**, found by inspecting the raw SSE chunk sizes: 1282 small chunks (1-3 chars each, genuine token deltas) followed by **one final 1767-char chunk containing the entire answer again**. `stream_mode="messages"` doesn't only stream live LLM token deltas -- it also surfaces any *complete* message added to `state["messages"]` via a node's return value, since from LangGraph's perspective that's indistinguishable from "a chat model produced this." `synthesis_node`'s Item E fix (`return {"answer": answer, "messages": [AIMessage(content=answer)]}`, added earlier so the next turn can read the prior conclusion) means every synthesis run's answer gets added to `messages` as a complete `AIMessage` -- and that addition itself gets surfaced as one more `"messages"`-mode event, layered on top of the genuine incremental deltas that already streamed the same text.
+
+Confirmed via a direct (non-graph) `ChatOllama.stream()` test that the model's own streaming terminates cleanly (final metadata-carrying chunk has empty `.content`) -- the duplication is specific to LangGraph's graph-level `"messages"` tap picking up the `AIMessage` add, not a `langchain_ollama` bug.
+
+Fix: `server.py`'s filter now also checks `isinstance(chunk, AIMessageChunk)` (from `langchain_core.messages`) before forwarding -- genuine incremental deltas are always `AIMessageChunk`; a complete message added via a node's return value is a plain `AIMessage`, which now gets filtered out of the answer channel entirely. Verified via the same live repro (0 duplication after the fix, `第一步`/`第二步`/`第三步`/`來源` each now appear exactly once) and a full eval-scored CLI regression (26/26, unaffected).
+
+**This does not affect short-term memory.** The `isinstance` filter only changes what `server.py` forwards to the SSE queue (i.e. what the frontend hears) -- it has no effect on `synthesis_node`'s actual return value or on what gets written to the checkpointer. The `AIMessage(content=answer)` still gets added to `state["messages"]` exactly as Item E designed, still gets read by `compact_previous_turn()` when building next turn's compacted `[HumanMessage(prev_query), AIMessage(prev_answer)]` pair. The two concerns -- "what gets persisted for cross-turn memory" and "what gets streamed live to the current viewer" -- turned out to be genuinely separate, and this bug was purely in the second one.
+
 ## Known gotcha carried over from earlier discussion (applies beyond this phase)
 
 Any caller that reconstructs the full `initial` state dict on every turn (as
