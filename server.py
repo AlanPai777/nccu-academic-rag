@@ -28,6 +28,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agentic_rag import build_graph, initial_state
 from rag.agentic.compaction import compact_previous_turn
+from rag.agentic.nodes.self_eval import _SELF_EVAL_MAX_TURN
 
 load_dotenv()  # rag/agentic/nodes/loop.py already does this on import; kept for direct runs
 
@@ -99,14 +100,27 @@ def _status_text(node_name: str, delta: dict) -> str | None:
     return _STATIC_STATUS.get(node_name)
 
 
-def _is_retry_signal(node_name: str, delta: dict) -> bool:
+def _is_retry_signal(node_name: str, delta: dict, current_turn: int) -> bool:
     """True exactly when self_eval_node just rejected the draft synthesis_node
-    answer that already finished streaming into the frontend's answer area --
-    the caller should tell the frontend to file that draft into the thinking
-    log and clear the answer area before the next synthesis_node run starts
-    streaming its replacement. Same self_eval_note-based condition as
-    _status_text above, for the same reason (情況B has no `messages`)."""
-    return node_name == "self_eval_node" and bool(delta.get("self_eval_note"))
+    answer AND the graph is actually about to retry -- the caller should then
+    tell the frontend to file that draft into the thinking log and clear the
+    answer area before the next synthesis_node run starts streaming its
+    replacement.
+
+    current_turn < _SELF_EVAL_MAX_TURN mirrors _after_self_eval's own ceiling
+    check (rag/agentic/nodes/self_eval.py) exactly: on the terminal turn,
+    self_eval_node can still reject (self_eval_note truthy) but
+    _after_self_eval routes to "end" instead of back to rewrite_node/
+    plan_node, so no replacement synthesis is ever coming. Without this
+    guard, that terminal rejection still emitted "reset", wiping the last
+    (possibly perfectly good) streamed answer with nothing left to refill
+    it -- confirmed via a live repro against "資科系系主任" running all the
+    way to turn 20 and leaving the frontend blank."""
+    return (
+        node_name == "self_eval_node"
+        and bool(delta.get("self_eval_note"))
+        and current_turn < _SELF_EVAL_MAX_TURN
+    )
 
 
 def _thread_config(session_id: str | None) -> dict:
@@ -125,6 +139,8 @@ async def _pump(
     (_generate) is the one place that knows how to format them for the
     frontend's `error` field, matching CourseLangChain/app.py's split.
     """
+    current_turn = 0  # tracks state["turn"] as rewrite_node advances it, so
+    # _is_retry_signal can mirror _after_self_eval's own ceiling check below
     try:
         if session_id:
             # Collapse the PREVIOUS turn's raw scratch before this new one
@@ -156,11 +172,13 @@ async def _pump(
             elif stream_mode == "updates":
                 for node_name, delta in payload.items():
                     delta = delta or {}
+                    if node_name == "rewrite_node" and "turn" in delta:
+                        current_turn = delta["turn"]
                     # Reset before the status line explaining why -- the
                     # frontend files the just-cleared draft into its
                     # thinking log labeled with that reason, so ordering
                     # them clear-then-explain reads correctly top to bottom.
-                    if _is_retry_signal(node_name, delta):
+                    if _is_retry_signal(node_name, delta, current_turn):
                         await queue.put({"type": "reset"})
                     text = _status_text(node_name, delta)
                     if text:
